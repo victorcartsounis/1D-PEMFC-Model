@@ -1,0 +1,21 @@
+[tool.poetry]
+name = "mmm1d"
+version = "0.1.0"
+description = "1D PEM fuel cell model in Python, based on MMM1D (Vetter & Schumacher, 2019)."
+authors = ["Victor <victor@example.com>"]
+readme = "README.md"
+license = "BSD-3-Clause"
+packages = [{ include = "mmm1d" }]
+
+[tool.poetry.dependencies]
+python = "^3.9"
+numpy = ">=1.24"
+scipy = ">=1.10"
+matplotlib = ">=3.7"
+
+[tool.poetry.group.dev.dependencies]
+pytest = ">=7.0"
+
+[build-system]
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"
