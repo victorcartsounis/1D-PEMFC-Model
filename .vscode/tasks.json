@@ -1,0 +1,23 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "poetry: install",
+            "type": "shell",
+            "command": "poetry install",
+            "problemMatcher": []
+        },
+        {
+            "label": "run: smoke test",
+            "type": "shell",
+            "command": "poetry run pytest tests/ -v",
+            "problemMatcher": []
+        },
+        {
+            "label": "run: default voltage sweep",
+            "type": "shell",
+            "command": "poetry run python run_example.py --no-show",
+            "problemMatcher": []
+        }
+    ]
+}

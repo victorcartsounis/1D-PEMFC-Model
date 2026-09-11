@@ -1,0 +1,45 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Run: default voltage sweep",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/run_example.py",
+            "args": ["--no-show"],
+            "console": "integratedTerminal",
+            "justMyCode": true
+        },
+        {
+            "name": "Run: full polarization curve (1.15-0.40 V)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/run_example.py",
+            "args": [
+                "--no-show",
+                "--voltages",
+                "1.15", "1.10", "1.05", "1.00", "0.95", "0.90", "0.85", "0.80",
+                "0.75", "0.70", "0.65", "0.60", "0.55", "0.50", "0.45", "0.40"
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": true
+        },
+        {
+            "name": "Python: Current File",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${file}",
+            "console": "integratedTerminal",
+            "justMyCode": true
+        },
+        {
+            "name": "Debug: smoke test",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "pytest",
+            "args": ["tests/test_smoke.py", "-v", "-s"],
+            "console": "integratedTerminal",
+            "justMyCode": false
+        }
+    ]
+}
