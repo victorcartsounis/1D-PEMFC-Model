@@ -5,15 +5,14 @@ Every invocation of ``run_example.py`` writes one timestamped directory under
 run, when, against which revision of the code, and how good the answer is.
 
 The point of separating the metrics from the figures is that "how hard the
-solver worked" and "how good the answer is" are different questions, and on
-this model they disagree. ``solve_bvp`` reports failure below about 0.75 V
-because ``Params.k_ad`` switches discontinuously where ``lam`` crosses
-``lambda_eq`` (see item 5 of ``NOTES.md``), yet a twelve-fold mesh refinement
-moves the current density by at most 0.13%. Elapsed time, node count and
-whether the tolerance was met are therefore all recorded as *cost and
-diagnostics*, while the quantity that actually certifies the result is the
-mesh-convergence measure in ``convergence_metrics``: how far the current
-density moves when the mesh is refined.
+solver worked" and "how good the answer is" are different questions, and they
+can disagree: a collocation solver can miss its tolerance on a solution that is
+converged to several digits, and can meet it on a mesh too coarse for the
+answer to have settled. Elapsed time, node count and whether the tolerance was
+met are therefore all recorded as *cost and diagnostics*, while the quantity
+that actually certifies the result is the mesh-convergence measure in
+``convergence_metrics``: how far the current density moves when the mesh is
+refined.
 
 Validation against experimental data is the other half of the picture and is
 deliberately not attempted here -- it needs measurements this repository does
@@ -284,11 +283,9 @@ def _log_text(metrics: RunMetrics, directory: Path, command: str) -> str:
             "",
             f"NOTE: solve_bvp did not meet tol at {len(missed)} voltage(s): "
             f"{np.array2string(missed, precision=3, separator=' ', max_line_width=200)}.",
-            "      Expected below about 0.75 V and not a defect in this port:",
-            "      k_ad switches discontinuously where lam crosses lambda_eq in",
-            "      the CCL, so no mesh resolves the residual there. MATLAB bvp4c",
-            "      warns identically. See item 5 of NOTES.md. Judge these points",
-            "      by the convergence section below, not by this column.",
+            "      A missed tolerance is a diagnostic, not a verdict: judge these",
+            "      points by the convergence section below, which reports how far",
+            "      the current density moves when the mesh is refined.",
         ]
 
     lines += [

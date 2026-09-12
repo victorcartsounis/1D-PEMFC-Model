@@ -130,15 +130,15 @@ python run_example.py --no-show --voltages 1.15 1.10 1.05 1.00 0.95 0.90 0.85 \
     0.80 0.75 0.70 0.65 0.60 0.55 0.50 0.45 0.40
 ```
 
-Below about 0.75 V `solve_bvp` reports that it could not meet `--tol`, and
-warns once per voltage. This matches the reference implementation rather than
-indicating a problem with the port: `k_ad` switches discontinuously where the
-membrane water content crosses its equilibrium value inside the cathode
-catalyst layer, so no mesh can drive the collocation residual at that crossing
-below the tolerance. MATLAB's `bvp4c` stops refining at `NMax = floor(10000/n)`
-= 125 points for this 80-equation system, warns, and carries on, which is what
-`--max-nodes` now defaults to. Raising it does not help: the solver simply
-refines around the crossing until it exhausts memory.
+At low voltage the mesh grows quickly and `solve_bvp` may report that it could
+not meet `--tol`, warning once per voltage. `--max-nodes` defaults to
+`10000 // 80` = 125, the ceiling MATLAB's `bvp4c` imposes on a system of this
+size (`NMax = floor(10000/n)`), so the port stops refining where the reference
+implementation stops and carries on from the same solution. Raising it is
+rarely the fix: where the adaptive mesh clusters around a feature the
+collocation method cannot resolve, the solver exhausts memory before the error
+estimate drops. Judge those points by the convergence check described below
+rather than by the tolerance flag.
 
 ### The run log
 
@@ -153,11 +153,12 @@ measurement that are deliberately kept apart:
   times finer, and `|dI|/I` between the two. This is the number that certifies
   a run: it says how much refining the mesh changes the answer.
 
-The distinction matters because the two disagree here. On the full sweep,
-`solve_bvp` reports it could not meet the tolerance at seven voltages, while no
-current density moves by more than 0.133% under a twelve-fold refinement. The
-tolerance column alone would reject solutions that are converged to three
-digits. See item 5 of `NOTES.md` for why.
+The distinction matters because the two can disagree. A solver can miss its
+tolerance on a solution that is converged to several digits — a discontinuity
+in a constitutive relation is enough to hold the local residual up no matter
+how fine the mesh gets — and can equally meet it on a mesh too coarse for the
+answer to have settled. So the tolerance column is read as a diagnostic, and
+the refinement comparison is what certifies a point.
 
 The refined solve roughly triples the runtime; pass `--no-convergence-check` to
 skip it. It is capped so that requesting a check can never be what exhausts
