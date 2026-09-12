@@ -1,467 +1,562 @@
+"""1D PEM fuel cell model: steady-state, non-isothermal, two-phase,
+macro-homogeneous membrane electrode assembly.
+
+Eight coupled quantities are resolved across the five MEA layers (anode GDL,
+anode catalyst layer, membrane, cathode catalyst layer, cathode GDL): electron
+and proton potentials, temperature, dissolved water content in the ionomer,
+water vapour and oxygen mass fractions, and liquid and gas pressures. Each obeys
+a second-order transport equation, written here as a potential/flux pair, giving
+16 first-order equations per layer.
+
+Physics and constitutive relations follow:
+
+    R. Vetter and J. O. Schumacher, "Free open reference implementation of a
+    two-phase PEM fuel cell model", Computer Physics Communications 234 (2019)
+    223-234. https://doi.org/10.1016/j.cpc.2018.07.023
+
+Solver design
+-------------
+Every layer carries its own equation set, coupled to its neighbours by
+continuity conditions at the four internal interfaces. ``scipy.integrate.solve_bvp``
+needs a strictly increasing mesh and has no notion of separate regions, so the
+five layers are *stacked* into a single system of ``N_REGIONS * N_STATE = 80``
+first-order ODEs over one normalised coordinate ``s`` in [0, 1], with a copy of
+``s`` per layer. The chain rule maps it back onto physical position:
+
+    x_region(s) = Lsum[region] + s*L[region]   =>   dY/ds = L[region] * dY/dx
+
+Interface continuity and gas-channel conditions are then imposed as boundary
+conditions on the stacked system (see :func:`boundary_conditions`), which is
+equivalent to solving the five layers as a coupled multi-region problem.
+
+Current simplifications
+-----------------------
+Two modelling choices are active in this version and are flagged where they
+occur, because they shape how the results should be read:
+
+* The evaporation/condensation source ``S_ec`` is set to zero, so phase change
+  between water vapour and liquid water is disabled.
+* Darcy's law in the cathode catalyst layer uses the GDL permeability
+  ``kappa_GDL`` rather than ``kappa_CL`` (see :func:`_ccl`).
+
+Together with the saturation floor described in :mod:`mmm1d.saturation`, these
+leave the two-phase behaviour inactive: liquid water neither forms nor moves.
+Re-enabling it is planned work; the regression tests pin the present behaviour
+so that change cannot happen unnoticed.
 """
-1D PEM fuel cell model -- steady-state, non-isothermal, two-phase,
-macro-homogeneous MEA model.
+from __future__ import annotations
 
-Starting point: the reference MATLAB implementation MMM1D.m
-(Vetter & Schumacher, 2019, Comp. Phys. Comm. 234:223-234;
-v2 by Herrendörfer & Schumacher).
+import warnings
+from dataclasses import dataclass, field
+from functools import partial
+from typing import Callable, Sequence
 
---------------------------------------------------------------------------
-NOTE ON THE SOLVER TRANSLATION (read before use)
---------------------------------------------------------------------------
-The original MATLAB code uses bvp4c with a MULTI-REGION boundary value
-problem: the mesh has duplicated nodes at the 4 internal interfaces,
-and odefun/bcfun receive a subdomain index (1..5), with bcfun receiving
-ya/yb as 16x5 matrices (one pair of endpoints per region).
-
-scipy.integrate.solve_bvp does NOT natively support multiple regions
-(it requires a strictly increasing mesh, with no duplicated nodes). To
-preserve exactly the same mathematical structure as the original
-problem, the 5 regions are here "stacked" into a single system of
-5*16=80 first-order ODEs, solved simultaneously over a single
-normalized independent variable s in [0,1] (one copy of s per region,
-all sharing the same mesh in s). The chain rule converts d/dx -> d/ds:
-
-    x_region_d(s) = Lsum[d-1] + s*L[d-1]      =>      dY/ds = L[d-1] * dY/dx
-
-The boundary conditions (bcfun) couple the blocks EXACTLY as in the
-original MATLAB code (potential/flux continuity at the interfaces,
-Dirichlet conditions at the gas channels). This is mathematically
-equivalent to the original MATLAB multi-region problem, just
-reformulated to fit the scipy API.
-"""
 import numpy as np
 from scipy.integrate import solve_bvp
 
 from .params import Params
-from .pc_s import pc_s
+from .saturation import saturation_from_capillary_pressure
+from .state import (ACTIVE_REGIONS, N_QUANTITIES, N_REGIONS, N_STATE, N_TOTAL,
+                    Quantity, Region, State, block_rows, stacked_index)
 
-NEQ = 8        # number of 2nd-order ODEs (potential-type state variables)
-NSTATE = 16    # NEQ*2 (potential + flux, first-order form)
-NREGION = 5    # AGDL, ACL, PEM, CCL, CGDL
-NTOT = NSTATE * NREGION  # 80
-
-REGION_NAMES = ["AGDL", "ACL", "PEM", "CCL", "CGDL"]
-
-# Names of the 8 potential/state variables, in the order in which they
-# appear within each 16-row block (potential, flux, potential, flux, ...)
-VAR_NAMES = ["phi_e", "phi_p", "T", "lambda", "w_H2O", "w_O2", "P_liq/s", "P_gas"]
-
-# Active-domain matrix per variable x region (identical to the one in
-# the original MMM1D_postprocessing.m)
-DOMAINS = np.array([
-    [1, 1, 0, 1, 1],  # phi_e
-    [0, 1, 1, 1, 0],  # phi_p
-    [1, 1, 1, 1, 1],  # T
-    [0, 1, 1, 1, 0],  # lambda
-    [1, 1, 0, 1, 1],  # w_H2O
-    [0, 0, 0, 1, 1],  # w_O2
-    [0, 0, 0, 1, 1],  # s (P_liq/rho_u_liq)
-    [1, 1, 0, 1, 1],  # P_gas (rho_u_gas)
-], dtype=bool)
+__all__ = ["solve", "SweepResult", "full_ode", "boundary_conditions",
+           "build_initial_guess", "Region", "State", "Quantity"]
 
 
 # =============================================================================
-# ODEFUN -- one function per subdomain (equivalent to the "case 1..5" blocks
-# in the original MATLAB code)
+# PER-REGION PHYSICS
+#
+# Each function takes one (N_STATE, m) block and returns its d/dx. Derivatives
+# are written into a zero-filled array by name, so a quantity can never land in
+# the wrong row; rows never written stay zero, which is how a layer declares a
+# quantity inactive.
 # =============================================================================
 
-def _unpack(block):
-    """block: array (16, m). Returns the 16 state variables as vectors."""
-    return (block[0], block[1], block[2], block[3], block[4], block[5],
-            block[6], block[7], block[8], block[9], block[10], block[11],
-            block[12], block[13], block[14], block[15])
+RegionODE = Callable[[np.ndarray, Params], np.ndarray]
 
 
-def _agdl(block, p):
-    """case 1: AGDL (anode gas diffusion layer)."""
-    phi_e, j_e, phi_p, j_p, T, j_T, lam, j_lam, w_H2O, j_H2O, w_O2, j_O2, \
-        P_liq, rho_u_liq, P_gas, rho_u_gas = _unpack(block)
-    z = np.zeros_like(phi_e)
-    dphi_e = dj_e = dphi_p = dj_p = dT = dj_T = dlam = dj_lam = z
-    dw_H2O = dj_H2O = dw_O2 = dj_O2 = dP_liq = drho_u_liq = dP_gas = drho_u_gas = z
+def _agdl(block: np.ndarray, params: Params) -> np.ndarray:
+    """Anode gas diffusion layer: electron, heat, vapour and gas transport."""
+    j_e = block[State.J_E]
+    T, j_T = block[State.T], block[State.J_T]
+    w_H2O, j_H2O = block[State.W_H2O], block[State.J_H2O]
+    P_gas, rho_u_gas = block[State.P_GAS], block[State.RHO_U_GAS]
 
     w_H2 = 1 - w_H2O
-    Mn = 1.0 / (w_H2O / p.M_H2O + w_H2 / p.M_H2)
-    C = P_gas / (p.R * T)
+    Mn = 1.0 / (w_H2O / params.M_H2O + w_H2 / params.M_H2)
+    C = P_gas / (params.R * T)
     rho_gas = Mn * C
     u_gas = rho_u_gas / rho_gas
-    dP_gas = -u_gas / (p.kappa_GDL / p.mu_gas)
-    dphi_e = -j_e / p.sigma_e_GDL
-    dT = -j_T / p.k_GDL
     s = np.zeros_like(T)
-    dw_H2O = -(j_H2O - rho_gas * w_H2O * u_gas) / (
-        rho_gas * p.D_H2O_A(p.eps_p_GDL, p.tau_GDL, s, T, P_gas))
-    dj_T = -j_e * dphi_e
 
-    return np.array([dphi_e, dj_e, dphi_p, dj_p, dT, dj_T, dlam, dj_lam,
-                      dw_H2O, dj_H2O, dw_O2, dj_O2, dP_liq, drho_u_liq,
-                      dP_gas, drho_u_gas])
+    d_phi_e = -j_e / params.sigma_e_GDL
+
+    d = np.zeros_like(block)
+    d[State.P_GAS] = -u_gas / (params.kappa_GDL / params.mu_gas)
+    d[State.PHI_E] = d_phi_e
+    d[State.T] = -j_T / params.k_GDL
+    d[State.W_H2O] = -(j_H2O - rho_gas * w_H2O * u_gas) / (
+        rho_gas * params.D_H2O_A(params.eps_p_GDL, params.tau_GDL, s, T, P_gas))
+    d[State.J_T] = -j_e * d_phi_e
+    return d
 
 
-def _acl(block, p):
-    """case 2: ACL (anode catalyst layer, HOR)."""
-    phi_e, j_e, phi_p, j_p, T, j_T, lam, j_lam, w_H2O, j_H2O, w_O2, j_O2, \
-        P_liq, rho_u_liq, P_gas, rho_u_gas = _unpack(block)
-    z = np.zeros_like(phi_e)
-    dphi_e = dj_e = dphi_p = dj_p = dT = dj_T = dlam = dj_lam = z
-    dw_H2O = dj_H2O = dw_O2 = dj_O2 = dP_liq = drho_u_liq = dP_gas = drho_u_gas = z
+def _acl(block: np.ndarray, params: Params) -> np.ndarray:
+    """Anode catalyst layer: hydrogen oxidation plus sorption into the ionomer."""
+    phi_e, j_e = block[State.PHI_E], block[State.J_E]
+    phi_p, j_p = block[State.PHI_P], block[State.J_P]
+    T, j_T = block[State.T], block[State.J_T]
+    lam, j_lam = block[State.LAMBDA], block[State.J_LAMBDA]
+    w_H2O, j_H2O = block[State.W_H2O], block[State.J_H2O]
+    P_gas, rho_u_gas = block[State.P_GAS], block[State.RHO_U_GAS]
 
     w_H2 = 1 - w_H2O
-    Mn = 1.0 / (w_H2O / p.M_H2O + w_H2 / p.M_H2)
-    x_H2O = w_H2O / p.M_H2O * Mn
+    Mn = 1.0 / (w_H2O / params.M_H2O + w_H2 / params.M_H2)
+    x_H2O = w_H2O / params.M_H2O * Mn
     x_H2 = 1 - x_H2O
-    C = P_gas / (p.R * T)
+    C = P_gas / (params.R * T)
     rho_gas = Mn * C
-    x_sat = p.P_sat(T) / P_gas
-    lambda_eq = p.sorption(x_H2O / x_sat)
+    x_sat = params.P_sat(T) / P_gas
+    lambda_eq = params.sorption(x_H2O / x_sat)
 
-    L_ACL = p.L[1]  # ACL thickness (L(2) in 1-based MATLAB indexing)
-    S_ad = p.k_ad(lam, lambda_eq, T) / (L_ACL * p.V_m) * (lambda_eq - lam)
+    L_ACL = params.L[Region.ACL]
+    S_ad = params.k_ad(lam, lambda_eq, T) / (L_ACL * params.V_m) * (lambda_eq - lam)
     P_H2 = x_H2 * P_gas
-    eta = phi_e - phi_p + T * p.DeltaS_HOR / (2 * p.F) + p.R * T / (2 * p.F) * np.log(P_H2 / p.P_ref)
-    i = p.BV(p.i_0_HOR(T), p.a_ACL, T, p.beta_HOR, eta)
-    S_F = i / (2 * p.F)
+    eta = (phi_e - phi_p + T * params.DeltaS_HOR / (2 * params.F)
+           + params.R * T / (2 * params.F) * np.log(P_H2 / params.P_ref))
+    i = params.butler_volmer(params.i_0_HOR(T), params.a_ACL, T, params.beta_HOR, eta)
+    S_F = i / (2 * params.F)
 
     u_gas = rho_u_gas / rho_gas
-    dP_gas = -u_gas / (p.kappa_CL / p.mu_gas)
-    dphi_e = -j_e / p.sigma_e_CL
-    dphi_p = -j_p / p.sigma_p(p.eps_i_CL, lam, T)
-    dT = -j_T / p.k_CL
-    dlam = (-j_lam + p.xi(lam) / p.F * j_p) * p.V_m / p.D_lambda(p.eps_i_CL, lam, T)
     s = np.zeros_like(T)
-    dw_H2O = -(j_H2O - rho_gas * w_H2O * u_gas) / (
-        rho_gas * p.D_H2O_A(p.eps_p_CL, p.tau_CL, s, T, P_gas))
-    dj_e = -i
-    dj_p = i
-    dj_T = -j_e * dphi_e - j_p * dphi_p + i * eta - S_F * T * p.DeltaS_HOR + p.H_ad * S_ad
-    dj_lam = S_ad
-    sumS_gas = -p.M_H2O * S_ad - p.M_H2 * S_F
-    dj_H2O = -S_ad * p.M_H2O
-    drho_u_gas = sumS_gas
+    d_phi_e = -j_e / params.sigma_e_CL
+    d_phi_p = -j_p / params.sigma_p(params.eps_i_CL, lam, T)
 
-    return np.array([dphi_e, dj_e, dphi_p, dj_p, dT, dj_T, dlam, dj_lam,
-                      dw_H2O, dj_H2O, dw_O2, dj_O2, dP_liq, drho_u_liq,
-                      dP_gas, drho_u_gas])
-
-
-def _pem(block, p):
-    """case 3: PEM (membrane)."""
-    phi_e, j_e, phi_p, j_p, T, j_T, lam, j_lam, w_H2O, j_H2O, w_O2, j_O2, \
-        P_liq, rho_u_liq, P_gas, rho_u_gas = _unpack(block)
-    z = np.zeros_like(phi_e)
-    dphi_e = dj_e = dphi_p = dj_p = dT = dj_T = dlam = dj_lam = z
-    dw_H2O = dj_H2O = dw_O2 = dj_O2 = dP_liq = drho_u_liq = dP_gas = drho_u_gas = z
-
-    dphi_p = -j_p / p.sigma_p(1.0, lam, T)
-    dT = -j_T / p.k_PEM
-    dlam = (-j_lam + p.xi(lam) / p.F * j_p) * p.V_m / p.D_lambda(1.0, lam, T)
-    dj_T = -j_p * dphi_p
-
-    return np.array([dphi_e, dj_e, dphi_p, dj_p, dT, dj_T, dlam, dj_lam,
-                      dw_H2O, dj_H2O, dw_O2, dj_O2, dP_liq, drho_u_liq,
-                      dP_gas, drho_u_gas])
+    d = np.zeros_like(block)
+    d[State.P_GAS] = -u_gas / (params.kappa_CL / params.mu_gas)
+    d[State.PHI_E] = d_phi_e
+    d[State.PHI_P] = d_phi_p
+    d[State.T] = -j_T / params.k_CL
+    d[State.LAMBDA] = ((-j_lam + params.electro_osmotic_drag(lam) / params.F * j_p)
+                       * params.V_m / params.D_lambda(params.eps_i_CL, lam, T))
+    d[State.W_H2O] = -(j_H2O - rho_gas * w_H2O * u_gas) / (
+        rho_gas * params.D_H2O_A(params.eps_p_CL, params.tau_CL, s, T, P_gas))
+    d[State.J_E] = -i
+    d[State.J_P] = i
+    d[State.J_T] = (-j_e * d_phi_e - j_p * d_phi_p + i * eta
+                    - S_F * T * params.DeltaS_HOR + params.H_ad * S_ad)
+    d[State.J_LAMBDA] = S_ad
+    d[State.J_H2O] = -S_ad * params.M_H2O
+    d[State.RHO_U_GAS] = -params.M_H2O * S_ad - params.M_H2 * S_F
+    return d
 
 
-def _ccl(block, p):
-    """case 4: CCL (cathode catalyst layer, ORR).
+def _pem(block: np.ndarray, params: Params) -> np.ndarray:
+    """Membrane: proton, heat and dissolved water transport only."""
+    j_p = block[State.J_P]
+    T, j_T = block[State.T], block[State.J_T]
+    lam, j_lam = block[State.LAMBDA], block[State.J_LAMBDA]
 
-    NOTE: exactly as in the original MMM1D.m, dP_gas and dP_liq in this
-    layer use ``kappa_GDL`` (not ``kappa_CL``) in Darcy's law. This is
-    preserved *as-is* from the original source code (the lines
-    "dP_gas=-u_gas./(kappa_GDL/mu_gas)" and the following dP_liq line,
-    inside case 4/CCL). It is worth confirming this choice against the
-    reference paper before using the results for the thesis -- it
-    could be intentional (CL and GDL with similar permeabilities in
-    the parameter set used) or a copy-paste slip from case 5/CGDL.
+    d_phi_p = -j_p / params.sigma_p(1.0, lam, T)
+
+    d = np.zeros_like(block)
+    d[State.PHI_P] = d_phi_p
+    d[State.T] = -j_T / params.k_PEM
+    d[State.LAMBDA] = ((-j_lam + params.electro_osmotic_drag(lam) / params.F * j_p)
+                       * params.V_m / params.D_lambda(1.0, lam, T))
+    d[State.J_T] = -j_p * d_phi_p
+    return d
+
+
+def _ccl(block: np.ndarray, params: Params) -> np.ndarray:
+    """Cathode catalyst layer: oxygen reduction, sorption and two-phase flow.
+
+    Darcy's law below uses ``kappa_GDL`` rather than ``kappa_CL``; see the
+    "Current simplifications" note in this module's docstring.
     """
-    phi_e, j_e, phi_p, j_p, T, j_T, lam, j_lam, w_H2O, j_H2O, w_O2, j_O2, \
-        P_liq, rho_u_liq, P_gas, rho_u_gas = _unpack(block)
-    z = np.zeros_like(phi_e)
-    dphi_e = dj_e = dphi_p = dj_p = dT = dj_T = dlam = dj_lam = z
-    dw_H2O = dj_H2O = dw_O2 = dj_O2 = dP_liq = drho_u_liq = dP_gas = drho_u_gas = z
+    phi_e, j_e = block[State.PHI_E], block[State.J_E]
+    phi_p, j_p = block[State.PHI_P], block[State.J_P]
+    T, j_T = block[State.T], block[State.J_T]
+    lam, j_lam = block[State.LAMBDA], block[State.J_LAMBDA]
+    w_H2O, j_H2O = block[State.W_H2O], block[State.J_H2O]
+    w_O2, j_O2 = block[State.W_O2], block[State.J_O2]
+    P_liq, rho_u_liq = block[State.P_LIQ], block[State.RHO_U_LIQ]
+    P_gas, rho_u_gas = block[State.P_GAS], block[State.RHO_U_GAS]
 
     w_N2 = 1 - w_H2O - w_O2
-    Mn = 1.0 / (w_H2O / p.M_H2O + w_O2 / p.M_O2 + w_N2 / p.M_N2)
-    x_H2O = w_H2O / p.M_H2O * Mn
-    x_O2 = w_O2 / p.M_O2 * Mn
-    C = P_gas / (p.R * T)
+    Mn = 1.0 / (w_H2O / params.M_H2O + w_O2 / params.M_O2 + w_N2 / params.M_N2)
+    x_H2O = w_H2O / params.M_H2O * Mn
+    x_O2 = w_O2 / params.M_O2 * Mn
+    C = P_gas / (params.R * T)
     rho_gas = Mn * C
-    p_c = P_liq - P_gas
-    s = pc_s(p_c, p.s_im)
-    x_sat = p.P_sat(T) / P_gas
-    S_ec = np.zeros_like(s)  # gamma_ec(...) is discarded in the original (see pc_s module docstring)
-    lambda_eq = p.sorption(x_H2O / x_sat)
+    s = saturation_from_capillary_pressure(P_liq - P_gas, params.s_im)
+    x_sat = params.P_sat(T) / P_gas
+    S_ec = np.zeros_like(s)  # phase change is inactive; see module docstring
+    lambda_eq = params.sorption(x_H2O / x_sat)
 
-    L_CCL = p.L[3]  # CCL thickness (L(4) in 1-based MATLAB indexing)
-    S_ad = p.k_ad(lam, lambda_eq, T) / (L_CCL * p.V_m) * (lambda_eq - lam)
+    L_CCL = params.L[Region.CCL]
+    S_ad = params.k_ad(lam, lambda_eq, T) / (L_CCL * params.V_m) * (lambda_eq - lam)
     P_O2 = x_O2 * P_gas
-    eta = -(p.DeltaH - T * p.DeltaS_ORR) / (2 * p.F) + p.R * T / (4 * p.F) * np.log(P_O2 / p.P_ref) - (phi_e - phi_p)
-    i = p.BV(p.i_0_ORR(T, P_O2), p.a_CCL, T, p.beta_ORR, eta)
-    S_F = i / (2 * p.F)
+    eta = (-(params.DeltaH - T * params.DeltaS_ORR) / (2 * params.F)
+           + params.R * T / (4 * params.F) * np.log(P_O2 / params.P_ref)
+           - (phi_e - phi_p))
+    i = params.butler_volmer(params.i_0_ORR(T, P_O2), params.a_CCL, T,
+                             params.beta_ORR, eta)
+    S_F = i / (2 * params.F)
 
     u_gas = rho_u_gas / rho_gas
-    u_liq = rho_u_liq / p.rho_liq
-    dP_gas = -u_gas / (p.kappa_GDL / p.mu_gas)          # (sic, see docstring above)
-    dP_liq = -u_liq / (p.kappa_GDL * p.kappa_rel_liq(s) / p.mu(T))  # (sic, see docstring above)
-    dphi_e = -j_e / p.sigma_e_CL
-    dphi_p = -j_p / p.sigma_p(p.eps_i_CL, lam, T)
-    dT = -j_T / p.k_CL
-    dlam = (-j_lam + p.xi(lam) / p.F * j_p) * p.V_m / p.D_lambda(p.eps_i_CL, lam, T)
-    dw_H2O = -(j_H2O - rho_gas * w_H2O * u_gas) / (
-        rho_gas * p.D_H2O_C(p.eps_p_CL, p.tau_CL, s, T, P_gas))
-    dw_O2 = -(j_O2 - rho_gas * w_O2 * u_gas) / (
-        rho_gas * p.D_O2(p.eps_p_CL, p.tau_CL, s, T, P_gas))
-    dj_e = i
-    dj_p = -i
-    dj_T = -j_e * dphi_e - j_p * dphi_p + i * eta - S_F * T * p.DeltaS_ORR + p.H_ad * S_ad + p.H_ec * S_ec
-    dj_lam = S_F + S_ad
-    sumS_gas = -p.M_H2O * (S_ec + S_ad) - p.M_O2 * S_F / 2
-    dj_H2O = -p.M_H2O * (S_ec + S_ad)
-    dj_O2 = -p.M_O2 * S_F / 2
-    drho_u_liq = p.M_H2O * S_ec
-    drho_u_gas = sumS_gas
+    u_liq = rho_u_liq / params.rho_liq
+    d_phi_e = -j_e / params.sigma_e_CL
+    d_phi_p = -j_p / params.sigma_p(params.eps_i_CL, lam, T)
 
-    return np.array([dphi_e, dj_e, dphi_p, dj_p, dT, dj_T, dlam, dj_lam,
-                      dw_H2O, dj_H2O, dw_O2, dj_O2, dP_liq, drho_u_liq,
-                      dP_gas, drho_u_gas])
+    d = np.zeros_like(block)
+    d[State.P_GAS] = -u_gas / (params.kappa_GDL / params.mu_gas)
+    d[State.P_LIQ] = -u_liq / (params.kappa_GDL * params.kappa_rel_liq(s)
+                               / params.mu_liq(T))
+    d[State.PHI_E] = d_phi_e
+    d[State.PHI_P] = d_phi_p
+    d[State.T] = -j_T / params.k_CL
+    d[State.LAMBDA] = ((-j_lam + params.electro_osmotic_drag(lam) / params.F * j_p)
+                       * params.V_m / params.D_lambda(params.eps_i_CL, lam, T))
+    d[State.W_H2O] = -(j_H2O - rho_gas * w_H2O * u_gas) / (
+        rho_gas * params.D_H2O_C(params.eps_p_CL, params.tau_CL, s, T, P_gas))
+    d[State.W_O2] = -(j_O2 - rho_gas * w_O2 * u_gas) / (
+        rho_gas * params.D_O2(params.eps_p_CL, params.tau_CL, s, T, P_gas))
+    d[State.J_E] = i
+    d[State.J_P] = -i
+    d[State.J_T] = (-j_e * d_phi_e - j_p * d_phi_p + i * eta
+                    - S_F * T * params.DeltaS_ORR + params.H_ad * S_ad
+                    + params.H_ec * S_ec)
+    d[State.J_LAMBDA] = S_F + S_ad
+    d[State.J_H2O] = -params.M_H2O * (S_ec + S_ad)
+    d[State.J_O2] = -params.M_O2 * S_F / 2
+    d[State.RHO_U_LIQ] = params.M_H2O * S_ec
+    d[State.RHO_U_GAS] = -params.M_H2O * (S_ec + S_ad) - params.M_O2 * S_F / 2
+    return d
 
 
-def _cgdl(block, p):
-    """case 5: CGDL (cathode gas diffusion layer)."""
-    phi_e, j_e, phi_p, j_p, T, j_T, lam, j_lam, w_H2O, j_H2O, w_O2, j_O2, \
-        P_liq, rho_u_liq, P_gas, rho_u_gas = _unpack(block)
-    z = np.zeros_like(phi_e)
-    dphi_e = dj_e = dphi_p = dj_p = dT = dj_T = dlam = dj_lam = z
-    dw_H2O = dj_H2O = dw_O2 = dj_O2 = dP_liq = drho_u_liq = dP_gas = drho_u_gas = z
+def _cgdl(block: np.ndarray, params: Params) -> np.ndarray:
+    """Cathode gas diffusion layer: electron, heat and two-phase transport."""
+    j_e = block[State.J_E]
+    T, j_T = block[State.T], block[State.J_T]
+    w_H2O, j_H2O = block[State.W_H2O], block[State.J_H2O]
+    w_O2, j_O2 = block[State.W_O2], block[State.J_O2]
+    P_liq, rho_u_liq = block[State.P_LIQ], block[State.RHO_U_LIQ]
+    P_gas, rho_u_gas = block[State.P_GAS], block[State.RHO_U_GAS]
 
     w_N2 = 1 - w_H2O - w_O2
-    Mn = 1.0 / (w_H2O / p.M_H2O + w_O2 / p.M_O2 + w_N2 / p.M_N2)
-    C = P_gas / (p.R * T)
+    Mn = 1.0 / (w_H2O / params.M_H2O + w_O2 / params.M_O2 + w_N2 / params.M_N2)
+    C = P_gas / (params.R * T)
     rho_gas = Mn * C
 
     u_gas = rho_u_gas / rho_gas
-    u_liq = rho_u_liq / p.rho_liq
-    p_c = P_liq - P_gas
-    s = pc_s(p_c, p.s_im)
-    dP_gas = -u_gas / (p.kappa_GDL / p.mu_gas)
-    dP_liq = -u_liq / (p.kappa_GDL * p.kappa_rel_liq(s) / p.mu(T))
-    S_ec = np.zeros_like(s)  # gamma_ec(...) is discarded in the original
-    dphi_e = -j_e / p.sigma_e_GDL
-    dT = -j_T / p.k_GDL
-    dw_H2O = -(j_H2O - rho_gas * w_H2O * u_gas) / (
-        rho_gas * p.D_H2O_C(p.eps_p_GDL, p.tau_GDL, s, T, P_gas))
-    dw_O2 = -(j_O2 - rho_gas * w_O2 * u_gas) / (
-        rho_gas * p.D_O2(p.eps_p_GDL, p.tau_GDL, s, T, P_gas))
-    dj_T = -j_e * dphi_e + p.H_ec * S_ec
-    sumS_gas = -p.M_H2O * S_ec
-    dj_H2O = -p.M_H2O * S_ec
-    drho_u_liq = p.M_H2O * S_ec
-    drho_u_gas = sumS_gas
+    u_liq = rho_u_liq / params.rho_liq
+    s = saturation_from_capillary_pressure(P_liq - P_gas, params.s_im)
+    S_ec = np.zeros_like(s)  # phase change is inactive; see module docstring
 
-    return np.array([dphi_e, dj_e, dphi_p, dj_p, dT, dj_T, dlam, dj_lam,
-                      dw_H2O, dj_H2O, dw_O2, dj_O2, dP_liq, drho_u_liq,
-                      dP_gas, drho_u_gas])
+    d_phi_e = -j_e / params.sigma_e_GDL
 
-
-_REGION_FUNCS = [_agdl, _acl, _pem, _ccl, _cgdl]  # index 0 -> region 1 (AGDL), etc.
+    d = np.zeros_like(block)
+    d[State.P_GAS] = -u_gas / (params.kappa_GDL / params.mu_gas)
+    d[State.P_LIQ] = -u_liq / (params.kappa_GDL * params.kappa_rel_liq(s)
+                               / params.mu_liq(T))
+    d[State.PHI_E] = d_phi_e
+    d[State.T] = -j_T / params.k_GDL
+    d[State.W_H2O] = -(j_H2O - rho_gas * w_H2O * u_gas) / (
+        rho_gas * params.D_H2O_C(params.eps_p_GDL, params.tau_GDL, s, T, P_gas))
+    d[State.W_O2] = -(j_O2 - rho_gas * w_O2 * u_gas) / (
+        rho_gas * params.D_O2(params.eps_p_GDL, params.tau_GDL, s, T, P_gas))
+    d[State.J_T] = -j_e * d_phi_e + params.H_ec * S_ec
+    d[State.J_H2O] = -params.M_H2O * S_ec
+    d[State.RHO_U_LIQ] = params.M_H2O * S_ec
+    d[State.RHO_U_GAS] = -params.M_H2O * S_ec
+    return d
 
 
-def full_ode(s, Y, p):
-    """Stacked system of all 5 regions (80 first-order ODEs) as a function of s in [0,1].
+REGION_ODES: dict[Region, RegionODE] = {
+    Region.AGDL: _agdl,
+    Region.ACL: _acl,
+    Region.PEM: _pem,
+    Region.CCL: _ccl,
+    Region.CGDL: _cgdl,
+}
 
-    Y: array (80, m). Returns dY/ds, same shape.
-    """
+
+def full_ode(s: np.ndarray, Y: np.ndarray, params: Params) -> np.ndarray:
+    """dY/ds of the stacked 80-equation system. ``Y`` is (80, m)."""
     dYds = np.empty_like(Y)
-    for d in range(1, NREGION + 1):
-        block = Y[(d - 1) * NSTATE: d * NSTATE, :]
-        dblock_dx = _REGION_FUNCS[d - 1](block, p)
-        dYds[(d - 1) * NSTATE: d * NSTATE, :] = p.L[d - 1] * dblock_dx
+    for region in Region:
+        rows = block_rows(region)
+        dYds[rows] = params.L[region] * REGION_ODES[region](Y[rows], params)
     return dYds
 
 
 # =============================================================================
-# BOUNDARY AND INTERFACE CONDITIONS (equivalent to bcfun)
+# BOUNDARY AND INTERFACE CONDITIONS
 # =============================================================================
 
-def _yidx(k, d):
-    """0-based index into the 80-entry stacked vector for variable k
-    (1..16, MATLAB-style) of region d (1..5, MATLAB-style)."""
-    return (d - 1) * NSTATE + (k - 1)
+def boundary_conditions(Y_left: np.ndarray, Y_right: np.ndarray,
+                        U_cell: float, params: Params) -> np.ndarray:
+    """Residuals that solve_bvp drives to zero.
 
-
-def bcfun(Ya, Yb, Uval, p):
-    """Line-by-line replica of bcfun(ya, yb, U) from the original MMM1D.m.
-
-    Ya, Yb: vectors (80,) holding the values at s=0 and s=1 of each of
-    the 5 stacked regions (block d occupies Ya[(d-1)*16 : d*16]).
+    ``Y_left`` and ``Y_right`` hold the state at s=0 and s=1 of every region.
+    All three vectors are viewed as a (region, state) grid, so
+    ``left[Region.CCL, State.W_O2]`` reads as "the oxygen mass fraction at the
+    left edge of the cathode catalyst layer". Every (region, state) pair owns
+    exactly one residual slot, holding the condition that closes it.
     """
-    def Y(y, k, d):
-        return y[_yidx(k, d)]
+    left = Y_left.reshape(N_REGIONS, N_STATE)
+    right = Y_right.reshape(N_REGIONS, N_STATE)
+    # slots not assigned below keep a homogeneous condition
+    residuals = Y_left.copy().reshape(N_REGIONS, N_STATE)
 
-    def r(i):
-        return i - 1  # 1-based MATLAB index -> 0-based Python index
+    AGDL, ACL, PEM, CCL, CGDL = Region
 
-    res = Ya.copy()  # "res = ya(:)" -- homogeneous condition by default
+    # ELECTRONS -- grounded at the anode plate, driven to U_cell at the cathode
+    residuals[AGDL, State.PHI_E] = left[AGDL, State.PHI_E]
+    residuals[AGDL, State.J_E] = left[ACL, State.J_E] - right[AGDL, State.J_E]
+    residuals[ACL, State.PHI_E] = left[ACL, State.PHI_E] - right[AGDL, State.PHI_E]
+    residuals[ACL, State.J_E] = right[ACL, State.J_E]
+    residuals[CCL, State.PHI_E] = left[CGDL, State.PHI_E] - right[CCL, State.PHI_E]
+    residuals[CCL, State.J_E] = left[CCL, State.J_E]
+    residuals[CGDL, State.PHI_E] = right[CGDL, State.PHI_E] - U_cell
+    residuals[CGDL, State.J_E] = left[CGDL, State.J_E] - right[CCL, State.J_E]
 
-    # ELECTRONS
-    res[r(0 * NEQ + 1)] = Y(Ya, 1, 1)
-    res[r(0 * NEQ + 2)] = Y(Ya, 2, 2) - Y(Yb, 2, 1)
-    res[r(2 * NEQ + 1)] = Y(Ya, 1, 2) - Y(Yb, 1, 1)
-    res[r(2 * NEQ + 2)] = Y(Yb, 2, 2)
-    res[r(6 * NEQ + 1)] = Y(Ya, 1, 5) - Y(Yb, 1, 4)
-    res[r(6 * NEQ + 2)] = Y(Ya, 2, 4)
-    res[r(8 * NEQ + 1)] = Y(Yb, 1, 5) - Uval
-    res[r(8 * NEQ + 2)] = Y(Ya, 2, 5) - Y(Yb, 2, 4)
+    # PROTONS -- confined to the ionomer, no flux at either catalyst boundary
+    residuals[ACL, State.PHI_P] = left[CCL, State.J_P] - right[PEM, State.J_P]
+    residuals[ACL, State.J_P] = left[ACL, State.J_P]
+    residuals[PEM, State.PHI_P] = left[PEM, State.PHI_P] - right[ACL, State.PHI_P]
+    residuals[PEM, State.J_P] = left[PEM, State.J_P] - right[ACL, State.J_P]
+    residuals[CCL, State.PHI_P] = left[CCL, State.PHI_P] - right[PEM, State.PHI_P]
+    residuals[CCL, State.J_P] = right[CCL, State.J_P]
 
-    # PROTONS
-    res[r(2 * NEQ + 3)] = Y(Ya, 4, 4) - Y(Yb, 4, 3)
-    res[r(2 * NEQ + 4)] = Y(Ya, 4, 2)
-    res[r(4 * NEQ + 3)] = Y(Ya, 3, 3) - Y(Yb, 3, 2)
-    res[r(4 * NEQ + 4)] = Y(Ya, 4, 3) - Y(Yb, 4, 2)
-    res[r(6 * NEQ + 3)] = Y(Ya, 3, 4) - Y(Yb, 3, 3)
-    res[r(6 * NEQ + 4)] = Y(Yb, 4, 4)
+    # TEMPERATURE -- continuous everywhere, Dirichlet at both plates
+    for region in list(Region)[1:]:
+        previous = Region(region - 1)
+        residuals[region, State.T] = left[region, State.T] - right[previous, State.T]
+        residuals[region, State.J_T] = left[region, State.J_T] - right[previous, State.J_T]
+    residuals[AGDL, State.T] = left[AGDL, State.T] - params.T_A
+    residuals[AGDL, State.J_T] = right[CGDL, State.T] - params.T_C
 
-    # TEMPERATURE
-    for d in (2, 3, 4, 5):
-        res[r(2 * (d - 1) * NEQ + 5)] = Y(Ya, 5, d) - Y(Yb, 5, d - 1)
-        res[r(2 * (d - 1) * NEQ + 6)] = Y(Ya, 6, d) - Y(Yb, 6, d - 1)
-    res[r(0 * NEQ + 5)] = Y(Ya, 5, 1) - p.T_A
-    res[r(0 * NEQ + 6)] = Y(Yb, 5, 5) - p.T_C
+    # DISSOLVED WATER -- confined to the ionomer
+    residuals[ACL, State.LAMBDA] = left[CCL, State.J_LAMBDA] - right[PEM, State.J_LAMBDA]
+    residuals[ACL, State.J_LAMBDA] = left[ACL, State.J_LAMBDA]
+    residuals[PEM, State.LAMBDA] = left[PEM, State.LAMBDA] - right[ACL, State.LAMBDA]
+    residuals[PEM, State.J_LAMBDA] = left[PEM, State.J_LAMBDA] - right[ACL, State.J_LAMBDA]
+    residuals[CCL, State.LAMBDA] = left[CCL, State.LAMBDA] - right[PEM, State.LAMBDA]
+    residuals[CCL, State.J_LAMBDA] = right[CCL, State.J_LAMBDA]
 
-    # DISSOLVED WATER
-    res[r(2 * NEQ + 7)] = Y(Ya, 8, 4) - Y(Yb, 8, 3)
-    res[r(2 * NEQ + 8)] = Y(Ya, 8, 2)
-    res[r(4 * NEQ + 7)] = Y(Ya, 7, 3) - Y(Yb, 7, 2)
-    res[r(4 * NEQ + 8)] = Y(Ya, 8, 3) - Y(Yb, 8, 2)
-    res[r(6 * NEQ + 7)] = Y(Ya, 7, 4) - Y(Yb, 7, 3)
-    res[r(6 * NEQ + 8)] = Y(Yb, 8, 4)
+    # WATER VAPOUR -- Dirichlet at both gas channels
+    residuals[AGDL, State.W_H2O] = left[AGDL, State.W_H2O] - params.w_H2O_A
+    residuals[AGDL, State.J_H2O] = left[ACL, State.J_H2O] - right[AGDL, State.J_H2O]
+    residuals[ACL, State.W_H2O] = left[ACL, State.W_H2O] - right[AGDL, State.W_H2O]
+    residuals[ACL, State.J_H2O] = right[ACL, State.J_H2O]
+    residuals[CCL, State.W_H2O] = left[CGDL, State.W_H2O] - right[CCL, State.W_H2O]
+    residuals[CCL, State.J_H2O] = left[CCL, State.J_H2O]
+    residuals[CGDL, State.W_H2O] = right[CGDL, State.W_H2O] - params.w_H2O_C
+    residuals[CGDL, State.J_H2O] = left[CGDL, State.J_H2O] - right[CCL, State.J_H2O]
 
-    # WATER VAPOR
-    res[r(0 * NEQ + 9)] = Y(Ya, 9, 1) - p.w_H2O_A
-    res[r(0 * NEQ + 10)] = Y(Ya, 10, 2) - Y(Yb, 10, 1)
-    res[r(2 * NEQ + 9)] = Y(Ya, 9, 2) - Y(Yb, 9, 1)
-    res[r(2 * NEQ + 10)] = Y(Yb, 10, 2)
-    res[r(6 * NEQ + 9)] = Y(Ya, 9, 5) - Y(Yb, 9, 4)
-    res[r(6 * NEQ + 10)] = Y(Ya, 10, 4)
-    res[r(8 * NEQ + 9)] = Y(Yb, 9, 5) - p.w_H2O_C
-    res[r(8 * NEQ + 10)] = Y(Ya, 10, 5) - Y(Yb, 10, 4)
+    # OXYGEN -- cathode side only
+    residuals[CCL, State.W_O2] = left[CGDL, State.W_O2] - right[CCL, State.W_O2]
+    residuals[CCL, State.J_O2] = left[CCL, State.J_O2]
+    residuals[CGDL, State.W_O2] = right[CGDL, State.W_O2] - params.w_O2_C
+    residuals[CGDL, State.J_O2] = left[CGDL, State.J_O2] - right[CCL, State.J_O2]
 
-    # OXYGEN
-    res[r(6 * NEQ + 11)] = Y(Ya, 11, 5) - Y(Yb, 11, 4)
-    res[r(6 * NEQ + 12)] = Y(Ya, 12, 4)
-    res[r(8 * NEQ + 11)] = Y(Yb, 11, 5) - p.w_O2_C
-    res[r(8 * NEQ + 12)] = Y(Ya, 12, 5) - Y(Yb, 12, 4)
+    # LIQUID WATER -- cathode side only
+    residuals[CCL, State.P_LIQ] = left[CGDL, State.P_LIQ] - right[CCL, State.P_LIQ]
+    residuals[CCL, State.RHO_U_LIQ] = left[CCL, State.RHO_U_LIQ]
+    residuals[CGDL, State.P_LIQ] = right[CGDL, State.P_LIQ] - params.P_liq_C
+    residuals[CGDL, State.RHO_U_LIQ] = (left[CGDL, State.RHO_U_LIQ]
+                                       - right[CCL, State.RHO_U_LIQ])
 
-    # LIQUID WATER
-    res[r(6 * NEQ + 13)] = Y(Ya, 13, 5) - Y(Yb, 13, 4)
-    res[r(6 * NEQ + 14)] = Y(Ya, 14, 4)
-    res[r(8 * NEQ + 13)] = Y(Yb, 13, 5) - p.P_liq_C
-    res[r(8 * NEQ + 14)] = Y(Ya, 14, 5) - Y(Yb, 14, 4)
+    # GAS -- Dirichlet at both gas channels
+    residuals[AGDL, State.P_GAS] = left[AGDL, State.P_GAS] - params.P_A
+    residuals[AGDL, State.RHO_U_GAS] = (left[ACL, State.RHO_U_GAS]
+                                        - right[AGDL, State.RHO_U_GAS])
+    residuals[ACL, State.P_GAS] = left[ACL, State.P_GAS] - right[AGDL, State.P_GAS]
+    residuals[ACL, State.RHO_U_GAS] = right[ACL, State.RHO_U_GAS]
+    residuals[CCL, State.P_GAS] = left[CGDL, State.P_GAS] - right[CCL, State.P_GAS]
+    residuals[CCL, State.RHO_U_GAS] = left[CCL, State.RHO_U_GAS]
+    residuals[CGDL, State.P_GAS] = right[CGDL, State.P_GAS] - params.P_C
+    residuals[CGDL, State.RHO_U_GAS] = (left[CGDL, State.RHO_U_GAS]
+                                        - right[CCL, State.RHO_U_GAS])
 
-    # GAS
-    res[r(0 * NEQ + 15)] = Y(Ya, 15, 1) - p.P_A
-    res[r(0 * NEQ + 16)] = Y(Ya, 16, 2) - Y(Yb, 16, 1)
-    res[r(2 * NEQ + 15)] = Y(Ya, 15, 2) - Y(Yb, 15, 1)
-    res[r(2 * NEQ + 16)] = Y(Yb, 16, 2)
-    res[r(6 * NEQ + 15)] = Y(Ya, 15, 5) - Y(Yb, 15, 4)
-    res[r(6 * NEQ + 16)] = Y(Ya, 16, 4)
-    res[r(8 * NEQ + 15)] = Y(Yb, 15, 5) - p.P_C
-    res[r(8 * NEQ + 16)] = Y(Ya, 16, 5) - Y(Yb, 16, 4)
-
-    return res
-
-
-# =============================================================================
-# INITIAL GUESS (equivalent to yinit)
-# =============================================================================
-
-def _yinit_region(d, p, U1):
-    phi_e = U1 if d > 3 else 0.0
-    phi_p = 0.0
-    T = (p.T_C + p.T_A) / 2
-    lam = p.sorption(1.0) if (1 < d < 5) else 0.0
-    w_H2O = p.w_H2O_A if d < 3 else (p.w_H2O_C if d > 3 else 0.0)
-    w_O2 = p.w_O2_C if d > 3 else 0.0
-    P_liq = p.P_liq_C if d > 3 else 0.0
-    P_gas = p.P_A if d < 3 else (p.P_C if d > 3 else 0.0)
-    return np.array([phi_e, 0, phi_p, 0, T, 0, lam, 0, w_H2O, 0, w_O2, 0, P_liq, 0, P_gas, 0])
-
-
-def build_initial_guess(p, U1, s_mesh):
-    m = len(s_mesh)
-    Y0 = np.zeros((NTOT, m))
-    for d in range(1, NREGION + 1):
-        y0d = _yinit_region(d, p, U1)
-        Y0[(d - 1) * NSTATE: d * NSTATE, :] = np.tile(y0d.reshape(-1, 1), (1, m))
-    return Y0
+    return residuals.ravel()
 
 
 # =============================================================================
-# MAIN SOLVE LOOP (equivalent to the body of MMM1D.m)
+# INITIAL GUESS
 # =============================================================================
 
-class MMM1DResult:
-    """Output container, equivalent to [I,U,SOL,x,Lsum,Np,Neq,domains]."""
+def _initial_state_for_region(region: Region, params: Params,
+                              U_cell: float) -> np.ndarray:
+    """Flat starting profile for one region: anode-side values before the
+    membrane, cathode-side values after it, zero where a quantity is inactive."""
+    anode_side = region < Region.PEM
+    cathode_side = region > Region.PEM
 
-    def __init__(self, I, U, SOL, Lsum, Np, Neq, domains, params):
-        self.I = I
-        self.U = U
-        self.SOL = SOL          # list of scipy solution objects (one per voltage)
-        self.Lsum = Lsum
-        self.Np = Np
-        self.Neq = Neq
-        self.domains = domains
-        self.params = params
+    state = np.zeros(N_STATE)
+    state[State.PHI_E] = U_cell if cathode_side else 0.0
+    state[State.T] = (params.T_C + params.T_A) / 2
+    if Region.ACL <= region <= Region.CCL:
+        state[State.LAMBDA] = params.sorption(1.0)
+    if anode_side:
+        state[State.W_H2O] = params.w_H2O_A
+        state[State.P_GAS] = params.P_A
+    elif cathode_side:
+        state[State.W_H2O] = params.w_H2O_C
+        state[State.W_O2] = params.w_O2_C
+        state[State.P_LIQ] = params.P_liq_C
+        state[State.P_GAS] = params.P_C
+    return state
 
 
-def solve(voltages=None, tol=1e-4, n_per_region=11, max_nodes=200000, verbose=0):
-    """Solves the model for a sweep of cell voltages.
+def build_initial_guess(params: Params, U_cell: float,
+                        s_mesh: np.ndarray) -> np.ndarray:
+    """(80, len(s_mesh)) starting guess, constant along ``s`` in every region."""
+    guess = np.zeros((N_TOTAL, len(s_mesh)))
+    for region in Region:
+        state = _initial_state_for_region(region, params, U_cell)
+        guess[block_rows(region)] = state[:, np.newaxis]
+    return guess
 
-    Equivalent to ``[I,U,SOL,x,Lsum,Np,Neq,domains] = MMM1D()``.
+
+# =============================================================================
+# SOLVE
+# =============================================================================
+
+#: Default ceiling on adaptive mesh refinement, mirroring MATLAB ``bvp4c``.
+#:
+#: ``bvp4c`` caps its mesh at ``NMax = floor(10000/n)``, which is 125 points
+#: for this ``n = 80`` system, and the reference implementation ran on that
+#: default. The cap is doing real work here: ``k_ad`` switches discontinuously
+#: where ``lam`` crosses ``lambda_eq`` inside the CCL (``Params.k_ad``), so no
+#: mesh can drive the collocation residual there below ``tol``. ``bvp4c`` hits
+#: NMax, warns that the tolerance was not met, and returns a usable solution
+#: the sweep continues from; below about 0.75 V that is what the published
+#: curve rests on.
+#:
+#: Translating that ceiling as 200000 was the one part of the port that was
+#: not faithful, and it is why sweeps below 0.55 V died. ``solve_bvp``
+#: factorizes a collocation Jacobian holding ``2 * N_TOTAL ** 2 = 12800``
+#: nonzeros per interval -- roughly 0.85 GB of peak memory per 1000 nodes --
+#: so chasing the discontinuity to 200000 nodes would need some 170 GB. The
+#: process dies inside SuperLU with a ``MemoryError`` before ``solve_bvp``
+#: can return ``success=False``, taking the converged part of the sweep with
+#: it.
+#:
+#: Raising this buys resolution everywhere except at the crossing, at about
+#: 0.85 GB per 1000 nodes, and diverges from the reference implementation.
+DEFAULT_MAX_NODES = 10_000 // N_TOTAL
+
+
+@dataclass(frozen=True, eq=False)
+class SweepResult:
+    """Outcome of a cell-voltage sweep."""
+
+    voltages: np.ndarray            #: [V] cell voltages, in sweep order
+    current_densities: np.ndarray   #: [A/cm^2] current density at each voltage
+    solutions: list                 #: solve_bvp solution object per voltage
+    params: Params                  #: parameter set the sweep was run with
+
+    @property
+    def n_voltages(self) -> int:
+        return len(self.voltages)
+
+    @property
+    def power_densities(self) -> np.ndarray:
+        """[W/cm^2] cell power density at each voltage."""
+        return self.voltages * self.current_densities
+
+    @property
+    def layer_boundaries(self) -> np.ndarray:
+        """[m] cumulative positions of the six layer interfaces."""
+        return self.params.Lsum
+
+    @property
+    def converged(self) -> bool:
+        return all(sol.success for sol in self.solutions)
+
+
+def solve(voltages: Sequence[float] | np.ndarray | None = None,
+          tol: float = 1e-4,
+          n_per_region: int = 11,
+          max_nodes: int = DEFAULT_MAX_NODES,
+          verbose: int = 0,
+          params: Params | None = None) -> SweepResult:
+    """Solve the model over a sweep of cell voltages.
+
+    Each voltage starts from the previous converged solution (continuation),
+    so the sweep should run from high voltage (low current) downwards.
 
     Parameters
     ----------
-    voltages : array_like, optional
-        Cell voltages [V] to sweep over (default: 1.15:-0.05:1.00, as in
-        the original).
-    tol : float
-        Tolerance for ``scipy.integrate.solve_bvp`` (RelTol was 1e-4 in
-        the original MATLAB code).
-    n_per_region : int
-        Number of initial mesh points per region (the original uses ~11).
-    max_nodes : int
-        Maximum number of nodes the adaptive mesh refinement can reach
-        (NMax in MATLAB).
-    verbose : int
-        Verbosity passed through to solve_bvp (0, 1 or 2).
+    voltages
+        Cell voltages [V]; defaults to the parameter set's own sweep.
+    tol
+        Tolerance for ``scipy.integrate.solve_bvp``.
+    n_per_region
+        Initial mesh points per region.
+    max_nodes
+        Ceiling on adaptive mesh refinement. Defaults to MATLAB ``bvp4c``'s
+        ``floor(10000/n)``, the ceiling the reference implementation ran on;
+        see ``DEFAULT_MAX_NODES`` before raising it.
+    verbose
+        Passed through to ``solve_bvp`` (0, 1 or 2).
+    params
+        Parameter set; defaults to ``Params()``.
     """
-    p = Params()
-    if voltages is None:
-        voltages = p.U_list
-    voltages = np.asarray(voltages, dtype=float)
+    params = params if params is not None else Params()
+    voltages = np.asarray(params.U_list if voltages is None else voltages, dtype=float)
 
     s_mesh = np.linspace(0.0, 1.0, n_per_region)
-    Y0 = build_initial_guess(p, voltages[0], s_mesh)
+    mesh, guess = s_mesh, build_initial_guess(params, voltages[0], s_mesh)
 
-    I_list = []
-    SOL = []
-    x0, y0 = s_mesh, Y0
-    idx_current = _yidx(2, 5)  # j_e at the end of region 5 (CGDL) = total current
+    # j_e at the right-hand end of the CGDL is the total cell current
+    current_index = stacked_index(State.J_E, Region.CGDL)
+    ode = partial(full_ode, params=params)
 
-    for Uval in voltages:
-        fun = lambda s, Y, U=Uval: full_ode(s, Y, p)
-        bc = lambda ya, yb, U=Uval: bcfun(ya, yb, U, p)
-        sol = solve_bvp(fun, bc, x0, y0, tol=tol, max_nodes=max_nodes, verbose=verbose)
+    currents: list[float] = []
+    solutions: list = []
+    for position, U_cell in enumerate(voltages):
+        bc = partial(boundary_conditions, U_cell=U_cell, params=params)
+        try:
+            sol = solve_bvp(ode, bc, mesh, guess, tol=tol,
+                            max_nodes=max_nodes, verbose=verbose)
+        except MemoryError:
+            # SuperLU could not factorize the collocation Jacobian; the mesh
+            # has run away. See DEFAULT_MAX_NODES.
+            remaining = voltages[position:]
+            warnings.warn(
+                f"ran out of memory solving U={U_cell:.3f} V with "
+                f"max_nodes={max_nodes}; stopping the sweep with "
+                f"{len(remaining)} of {len(voltages)} voltages unsolved: "
+                f"{np.array2string(remaining, precision=3)}")
+            voltages = voltages[:position]
+            break
+
         if not sol.success:
-            import warnings
-            warnings.warn(f"BVP did not converge for U={Uval:.3f} V: {sol.message}")
-        I_val = sol.y[idx_current, -1] / 1e4  # [A/cm^2]
-        I_list.append(I_val)
-        SOL.append(sol)
-        x0, y0 = sol.x, sol.y  # continuation: next voltage starts from the previous solution
+            # bvp4c warns and carries on in exactly this situation, and the
+            # reference curve below about 0.75 V is made of such points, so
+            # the sweep continues too.
+            warnings.warn(f"BVP did not converge for U={U_cell:.3f} V: {sol.message}")
 
-    return MMM1DResult(
-        I=np.array(I_list), U=voltages, SOL=SOL, Lsum=p.Lsum,
-        Np=len(voltages), Neq=NEQ, domains=DOMAINS, params=p,
-    )
+        if not np.all(np.isfinite(sol.y)):
+            # Continuation is genuinely poisoned: a non-finite solution cannot
+            # seed the next voltage, so every later point would fail too.
+            remaining = voltages[position:]
+            warnings.warn(
+                f"solution for U={U_cell:.3f} V is not finite; stopping the "
+                f"sweep with {len(remaining)} of {len(voltages)} voltages "
+                f"unsolved: {np.array2string(remaining, precision=3)}")
+            voltages = voltages[:position]
+            break
+
+        currents.append(sol.y[current_index, -1] / 1e4)  # [A/m^2] -> [A/cm^2]
+        solutions.append(sol)
+        mesh, guess = sol.x, sol.y  # continuation into the next voltage
+
+    return SweepResult(voltages=voltages,
+                       current_densities=np.asarray(currents),
+                       solutions=solutions,
+                       params=params)

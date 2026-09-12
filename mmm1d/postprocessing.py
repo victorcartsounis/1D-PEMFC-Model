@@ -1,123 +1,129 @@
-"""
-Post-processing -- spatial profile extraction and generation of the
-potentials, fluxes and polarization curve plots.
+"""Spatial profile extraction and the potentials, fluxes and polarization plots."""
+from __future__ import annotations
 
-Equivalent to the original MMM1D_postprocessing.m.
-"""
-import numpy as np
 import matplotlib.pyplot as plt
+import numpy as np
 
-from .model import NSTATE, NREGION, DOMAINS, VAR_NAMES
+from .model import SweepResult
+from .params import Params
+from .state import (ACTIVE_REGIONS, N_REGIONS, N_STATE, Quantity, Region,
+                    block_rows)
 
-FIG_NAMES = ["Potentials", "Fluxes"]
+#: Axis labels for the quantity itself and for its flux.
+VALUE_LABELS: dict[Quantity, str] = {
+    Quantity.PHI_E: r"$\phi_e\ [\mathrm{V}]$",
+    Quantity.PHI_P: r"$\phi_p\ [\mathrm{V}]$",
+    Quantity.T: r"$T\ [\mathrm{K}]$",
+    Quantity.LAMBDA: r"$\lambda\ [-]$",
+    Quantity.W_H2O: r"$w_{H_2O}\ [-]$",
+    Quantity.W_O2: r"$w_{O_2}\ [-]$",
+    Quantity.SATURATION: r"$s\ [-]$",
+    Quantity.P_GAS: r"$P_\mathrm{gas}\ [\mathrm{Pa}]$",
+}
 
-UNIT_SCALE = np.array([
-    [1, 1, 1, 1, 1, 1, 1, 1],
-    [1e-4, 1e-4, 1e-4, 1e2, 1e2, 1e2, 1e2, 1e2],
-])
+FLUX_LABELS: dict[Quantity, str] = {
+    Quantity.PHI_E: r"$j_e\ [\mathrm{A/cm}^2]$",
+    Quantity.PHI_P: r"$j_p\ [\mathrm{A/cm}^2]$",
+    Quantity.T: r"$j_T\ [\mathrm{W/cm}^2]$",
+    Quantity.LAMBDA: r"$j_\lambda\ [\mu\mathrm{mol/cm}^2\mathrm{s}]$",
+    Quantity.W_H2O: r"$j_{H_2O}\ [\mu\mathrm{g/cm}^2\mathrm{s}]$",
+    Quantity.W_O2: r"$j_{O_2}\ [\mu\mathrm{g/cm}^2\mathrm{s}]$",
+    Quantity.SATURATION: r"$j_s\ [\mu\mathrm{mol/cm}^2\mathrm{s}]$",
+    Quantity.P_GAS: r"$\rho_\mathrm{gas}\cdot u_\mathrm{gas}\ "
+                    r"[\mathrm{\mu g}/\mathrm{cm}^2\mathrm{s}]$",
+}
 
-QUANTITY = [
-    [r"$\phi_e\ [\mathrm{V}]$", r"$\phi_p\ [\mathrm{V}]$", r"$T\ [\mathrm{K}]$",
-     r"$\lambda\ [-]$", r"$w_{H_2O}\ [-]$", r"$w_{O_2}\ [-]$", r"$s\ [-]$",
-     r"$P_\mathrm{gas}\ [\mathrm{Pa}]$"],
-    [r"$j_e\ [\mathrm{A/cm}^2]$", r"$j_p\ [\mathrm{A/cm}^2]$", r"$j_T\ [\mathrm{W/cm}^2]$",
-     r"$j_\lambda\ [\mu\mathrm{mol/cm}^2\mathrm{s}]$", r"$j_{H_2O}\ [\mu\mathrm{g/cm}^2\mathrm{s}]$",
-     r"$j_{O_2}\ [\mu\mathrm{g/cm}^2\mathrm{s}]$", r"$j_s\ [\mu\mathrm{mol/cm}^2\mathrm{s}]$",
-     r"$\rho_\mathrm{gas}\cdot u_\mathrm{gas}\ [\mathrm{\mu g}/\mathrm{cm}^2\mathrm{s}]$"],
-]
+#: SI -> plot units. Quantities are plotted as-is; fluxes are rescaled.
+VALUE_SCALE: dict[Quantity, float] = {q: 1.0 for q in Quantity}
+FLUX_SCALE: dict[Quantity, float] = {
+    Quantity.PHI_E: 1e-4, Quantity.PHI_P: 1e-4, Quantity.T: 1e-4,
+    Quantity.LAMBDA: 1e2, Quantity.W_H2O: 1e2, Quantity.W_O2: 1e2,
+    Quantity.SATURATION: 1e2, Quantity.P_GAS: 1e2,
+}
 
 
-def extract_profiles(sol, p, n_dense=201):
-    """Extracts continuous, physical spatial profiles from the stacked
-    (80, m) solve_bvp solution, filling with NaN the regions where each
-    of the 8 variables is not physically active (equivalent to the
-    "fill solution on inactive domains with NaN" step in the original
-    MATLAB code).
+def extract_profiles(sol, params: Params,
+                     n_dense: int = 201) -> tuple[np.ndarray, np.ndarray]:
+    """Continuous spatial profiles from a stacked solve_bvp solution.
 
-    Returns
-    -------
-    x_all : np.ndarray, shape (5*n_dense,)
-        Physical position [m], concatenated region by region.
-    y_all : np.ndarray, shape (16, 5*n_dense)
-        The 16 variables (potential+flux interleaved) in the same order
-        as VAR_NAMES; NaN where the variable is inactive in that region.
+    Returns physical positions [m] and the 16 state rows, concatenated region by
+    region, with NaN wherever a quantity is not physically defined.
     """
     s_dense = np.linspace(0.0, 1.0, n_dense)
-    Yfull = sol.sol(s_dense)  # (80, n_dense)
+    stacked = sol.sol(s_dense)
 
-    x_all = np.empty(NREGION * n_dense)
-    y_all = np.empty((NSTATE, NREGION * n_dense))
+    positions = np.empty(N_REGIONS * n_dense)
+    profiles = np.empty((N_STATE, N_REGIONS * n_dense))
 
-    for d in range(1, NREGION + 1):
-        cols = slice((d - 1) * n_dense, d * n_dense)
-        x_all[cols] = p.Lsum[d - 1] + s_dense * p.L[d - 1]
-        block = Yfull[(d - 1) * NSTATE: d * NSTATE, :]
-        for var in range(len(VAR_NAMES)):
-            active = DOMAINS[var, d - 1]
-            rows = slice(2 * var, 2 * var + 2)
-            y_all[rows, cols] = block[rows, :] if active else np.nan
+    for region in Region:
+        columns = slice(region * n_dense, (region + 1) * n_dense)
+        positions[columns] = params.Lsum[region] + s_dense * params.L[region]
+        block = stacked[block_rows(region)]
+        for quantity in Quantity:
+            active = region in ACTIVE_REGIONS[quantity]
+            profiles[quantity.rows, columns] = block[quantity.rows] if active else np.nan
 
-    return x_all, y_all
-
-
-def plot_potentials_and_fluxes(result, n_dense=201, figsize=(14, 5)):
-    """Generates the 'Potentials' and 'Fluxes' figures (one curve per
-    cell voltage, one subplot per each of the 8 variables), equivalent
-    to the first block of MMM1D_postprocessing.m."""
-    p = result.params
-    profiles = [extract_profiles(sol, p, n_dense) for sol in result.SOL]
-    cmap = plt.get_cmap("jet")
-    colors = [cmap(k / max(1, result.Np - 1)) for k in range(result.Np)]
-
-    figs = []
-    for m in range(2):  # 0: potentials, 1: fluxes
-        fig, axes = plt.subplots(2, 4, figsize=figsize, num=FIG_NAMES[m])
-        axes = axes.ravel()
-        for n in range(8):
-            ax = axes[n]
-            us = UNIT_SCALE[m, n]
-            active_regions = np.where(DOMAINS[n, :])[0]
-            x_lo = p.Lsum[active_regions[0]]
-            x_hi = p.Lsum[active_regions[-1] + 1]
-            for k in range(result.Np):
-                x_all, y_all = profiles[k]
-                row = 2 * n + m
-                ax.plot(x_all * 1e6, y_all[row, :] * us, color=colors[k],
-                        label=f"{result.U[k]:.2f} V")
-            ax.set_xlim(x_lo * 1e6, x_hi * 1e6)
-            ax.set_xlabel("x [um]")
-            ax.set_ylabel(QUANTITY[m][n])
-            for xi in p.Lsum[1:-1]:
-                ax.axvline(xi * 1e6, color="k", linewidth=0.8)
-            ax.grid(False)
-        handles, labels = axes[0].get_legend_handles_labels()
-        fig.legend(handles, labels, loc="upper right", fontsize=8, ncol=1)
-        fig.suptitle(FIG_NAMES[m])
-        fig.tight_layout(rect=[0, 0, 0.94, 0.96])
-        figs.append(fig)
-    return figs
+    return positions, profiles
 
 
-def plot_polarization_curve(result, figsize=(7, 5)):
-    """Generates the polarization curve (cell voltage and power density
-    vs. current density), equivalent to the second block of
-    MMM1D_postprocessing.m."""
-    I, U = result.I, result.U
-    P = I * U
+def plot_potentials_and_fluxes(result: SweepResult, n_dense: int = 201,
+                               figsize: tuple[float, float] = (14, 5)) -> list:
+    """One figure of the eight quantities and one of their eight fluxes."""
+    params = result.params
+    profiles = [extract_profiles(sol, params, n_dense) for sol in result.solutions]
+    colormap = plt.get_cmap("jet")
+    colors = [colormap(i / max(1, result.n_voltages - 1))
+              for i in range(result.n_voltages)]
 
-    fig, ax1 = plt.subplots(figsize=figsize, num="Polarization curve")
-    ax1.plot(I, U, "b-o", label="Cell voltage")
-    ax1.set_xlabel("Current density [A/cm$^2$]")
-    ax1.set_ylabel("Cell voltage [V]", color="b")
-    ax1.tick_params(axis="y", labelcolor="b")
-    ax1.set_xlim(0, max(I.max(), 1e-12))
-    ax1.set_ylim(0, max(U.max(), P.max()))
+    figures = []
+    for name, labels, scales, row_of in (
+        ("Potentials", VALUE_LABELS, VALUE_SCALE, lambda q: q.value_row),
+        ("Fluxes", FLUX_LABELS, FLUX_SCALE, lambda q: q.flux_row),
+    ):
+        figure, axes = plt.subplots(2, 4, figsize=figsize, num=name)
+        for quantity, axis in zip(Quantity, axes.ravel()):
+            active = ACTIVE_REGIONS[quantity]
+            row = row_of(quantity)
+            for i, (voltage, (positions, values)) in enumerate(zip(result.voltages,
+                                                                   profiles)):
+                axis.plot(positions * 1e6, values[row] * scales[quantity],
+                          color=colors[i], label=f"{voltage:.2f} V")
+            axis.set_xlim(params.Lsum[active[0]] * 1e6,
+                          params.Lsum[active[-1] + 1] * 1e6)
+            axis.set_xlabel("x [um]")
+            axis.set_ylabel(labels[quantity])
+            for interface in params.Lsum[1:-1]:
+                axis.axvline(interface * 1e6, color="k", linewidth=0.8)
+            axis.grid(False)
+        handles, legend_labels = axes.ravel()[0].get_legend_handles_labels()
+        figure.legend(handles, legend_labels, loc="upper right", fontsize=8, ncol=1)
+        figure.suptitle(name)
+        figure.tight_layout(rect=[0, 0, 0.94, 0.96])
+        figures.append(figure)
+    return figures
 
-    ax2 = ax1.twinx()
-    ax2.plot(I, P, "r-s", label="Power density")
-    ax2.set_ylabel("Power density [W/cm$^2$]", color="r")
-    ax2.tick_params(axis="y", labelcolor="r")
-    ax2.set_ylim(0, max(U.max(), P.max()))
 
-    fig.tight_layout()
-    return fig
+def plot_polarization_curve(result: SweepResult,
+                            figsize: tuple[float, float] = (7, 5)):
+    """Cell voltage and power density against current density."""
+    current = result.current_densities
+    voltage = result.voltages
+    power = result.power_densities
+    upper = max(voltage.max(), power.max())
+
+    figure, voltage_axis = plt.subplots(figsize=figsize, num="Polarization curve")
+    voltage_axis.plot(current, voltage, "b-o", label="Cell voltage")
+    voltage_axis.set_xlabel("Current density [A/cm$^2$]")
+    voltage_axis.set_ylabel("Cell voltage [V]", color="b")
+    voltage_axis.tick_params(axis="y", labelcolor="b")
+    voltage_axis.set_xlim(0, max(current.max(), 1e-12))
+    voltage_axis.set_ylim(0, upper)
+
+    power_axis = voltage_axis.twinx()
+    power_axis.plot(current, power, "r-s", label="Power density")
+    power_axis.set_ylabel("Power density [W/cm$^2$]", color="r")
+    power_axis.tick_params(axis="y", labelcolor="r")
+    power_axis.set_ylim(0, upper)
+
+    figure.tight_layout()
+    return figure

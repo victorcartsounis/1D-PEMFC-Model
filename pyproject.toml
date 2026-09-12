@@ -1,8 +1,8 @@
 [tool.poetry]
 name = "mmm1d"
-version = "0.1.0"
-description = "1D PEM fuel cell model in Python, based on MMM1D (Vetter & Schumacher, 2019)."
-authors = ["Victor <victor@example.com>"]
+version = "0.2.0"
+description = "A 1D steady-state, non-isothermal, two-phase PEM fuel cell model in Python."
+authors = ["Victor Constantin Cartsounis <victor@example.com>"]
 readme = "README.md"
 license = "BSD-3-Clause"
 packages = [{ include = "mmm1d" }]
