@@ -109,8 +109,19 @@ python run_example.py
 ```
 
 This solves the default voltage sweep (1.15 to 1.00 V in 50 mV steps), prints
-the current and power density at each voltage, and writes `potentials.png`,
-`fluxes.png` and `polarization_curve.png` to `figs/`.
+the current and power density at each voltage, and writes one timestamped run
+directory under `results/`:
+
+```
+results/run_20260912_102554/
+    potentials.png
+    fluxes.png
+    polarization_curve.png
+    metrics.log
+```
+
+Every run gets its own directory, so results are never overwritten and any
+figure can be traced back to the settings that produced it.
 
 For a full polarization curve including the mass-transport-limited region:
 
@@ -128,6 +139,33 @@ below the tolerance. MATLAB's `bvp4c` stops refining at `NMax = floor(10000/n)`
 = 125 points for this 80-equation system, warns, and carries on, which is what
 `--max-nodes` now defaults to. Raising it does not help: the solver simply
 refines around the crossing until it exhausts memory.
+
+### The run log
+
+`metrics.log` records the run's provenance (timestamp, git revision, exact
+command, host, library versions), the solver settings, and two kinds of
+measurement that are deliberately kept apart:
+
+* **Cost and diagnostics** — elapsed time, node count per voltage, the largest
+  `rms_residual`, and whether `solve_bvp` met its tolerance. These say how hard
+  the solver worked, not whether the answer is right.
+* **Verification** — the current density re-solved on a mesh `--refine-factor`
+  times finer, and `|dI|/I` between the two. This is the number that certifies
+  a run: it says how much refining the mesh changes the answer.
+
+The distinction matters because the two disagree here. On the full sweep,
+`solve_bvp` reports it could not meet the tolerance at seven voltages, while no
+current density moves by more than 0.133% under a twelve-fold refinement. The
+tolerance column alone would reject solutions that are converged to three
+digits. See item 5 of `NOTES.md` for why.
+
+The refined solve roughly triples the runtime; pass `--no-convergence-check` to
+skip it. It is capped so that requesting a check can never be what exhausts
+memory.
+
+Not measured: agreement with experimental data. That is a separate question
+from numerical convergence, and it is the one that decides whether a change to
+the physics is an improvement.
 
 From Python:
 
