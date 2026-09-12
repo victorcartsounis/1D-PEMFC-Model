@@ -52,6 +52,35 @@ as a potential/flux pair — 16 first-order equations per layer, 80 in total.
 | Liquid water pressure | `P_liq` | cathode side |
 | Gas pressure | `P_gas` | GDLs and CLs |
 
+## Example results
+
+All three figures below come from one command — the full voltage sweep of the
+[Running](#running) section — and are the same files any run writes into its
+own `results/` directory.
+
+The polarization curve is the model's headline output: cell voltage against
+current density, with the power density on the right-hand axis. The activation
+losses dominate near open circuit, the ohmic region is the near-linear middle,
+and the curve bends over at high current where oxygen transport to the cathode
+catalyst layer starts to limit the cell.
+
+![Polarization and power density curves](docs/images/polarization_curve.png)
+
+The eight quantities of the table above, plotted across the MEA. Each curve is
+one cell voltage, dark blue (open circuit) through dark red (highest current),
+and each panel spans only the layers where that quantity is defined. The
+vertical lines mark the layer interfaces; anode is on the left, cathode on the
+right.
+
+![Profiles of the eight state variables across the MEA](docs/images/potentials.png)
+
+The matching fluxes — the second half of each potential/flux pair. Electron and
+proton current hand off inside the catalyst layers, which is what makes `j_e`
+and `j_p` mirror each other there, and the flat sections elsewhere are simply
+the layers where no source term acts.
+
+![Flux profiles across the MEA](docs/images/fluxes.png)
+
 ## Solver design
 
 Every layer carries its own equation set, coupled to its neighbours by
@@ -85,6 +114,7 @@ tests/
 ├── test_smoke.py                # convergence and monotonicity
 ├── test_regression.py           # full solution pinned to the golden file
 └── test_constitutive.py         # parameters and saturation inversion
+docs/images/                     # example figures shown in this README
 run_example.py                   # command-line entry point
 ```
 
