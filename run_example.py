@@ -40,9 +40,10 @@ def main():
     result = solve(voltages=args.voltages, tol=args.tol,
                    n_per_region=args.n_per_region, max_nodes=args.max_nodes)
 
-    print("U [V]      I [A/cm^2]")
-    for U, I in zip(result.U, result.I):
-        print(f"{U:6.3f}     {I:10.4f}")
+    print("U [V]      I [A/cm^2]   P [W/cm^2]")
+    for voltage, current, power in zip(result.voltages, result.current_densities,
+                                       result.power_densities):
+        print(f"{voltage:6.3f}     {current:10.4f}   {power:10.4f}")
 
     os.makedirs(args.outdir, exist_ok=True)
     fig_pot, fig_flux = plot_potentials_and_fluxes(result)
