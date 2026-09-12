@@ -12,7 +12,7 @@ import os
 
 import matplotlib
 
-from mmm1d.model import solve
+from mmm1d.model import DEFAULT_MAX_NODES, solve
 from mmm1d.postprocessing import plot_potentials_and_fluxes, plot_polarization_curve
 
 
@@ -22,11 +22,14 @@ def main():
     parser.add_argument("--voltages", type=float, nargs="+", default=None,
                         help="cell voltages [V] to sweep over (default: 1.15 to 1.00 in 50 mV steps)")
     parser.add_argument("--tol", type=float, default=1e-4,
-                        help="tolerance passed to scipy.integrate.solve_bvp (default: 1e-4)")
+                        help="tolerance passed to scipy.integrate.solve_bvp (default: 1e-4, "
+                             "the RelTol of the MATLAB reference implementation)")
     parser.add_argument("--n-per-region", type=int, default=11,
                         help="number of initial mesh points per region (default: 11)")
-    parser.add_argument("--max-nodes", type=int, default=200000,
-                        help="maximum number of mesh nodes (default: 200000)")
+    parser.add_argument("--max-nodes", type=int, default=DEFAULT_MAX_NODES,
+                        help=f"maximum number of mesh nodes (default: {DEFAULT_MAX_NODES}, "
+                             "matching MATLAB bvp4c's floor(10000/n); raising it costs "
+                             "about 0.85 GB of memory per 1000 nodes)")
     parser.add_argument("--outdir", default="figs",
                         help="directory the figures are written to (default: figs)")
     parser.add_argument("--no-show", action="store_true",

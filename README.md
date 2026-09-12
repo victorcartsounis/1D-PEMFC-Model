@@ -119,6 +119,16 @@ python run_example.py --no-show --voltages 1.15 1.10 1.05 1.00 0.95 0.90 0.85 \
     0.80 0.75 0.70 0.65 0.60 0.55 0.50 0.45 0.40
 ```
 
+Below about 0.75 V `solve_bvp` reports that it could not meet `--tol`, and
+warns once per voltage. This matches the reference implementation rather than
+indicating a problem with the port: `k_ad` switches discontinuously where the
+membrane water content crosses its equilibrium value inside the cathode
+catalyst layer, so no mesh can drive the collocation residual at that crossing
+below the tolerance. MATLAB's `bvp4c` stops refining at `NMax = floor(10000/n)`
+= 125 points for this 80-equation system, warns, and carries on, which is what
+`--max-nodes` now defaults to. Raising it does not help: the solver simply
+refines around the crossing until it exhausts memory.
+
 From Python:
 
 ```python

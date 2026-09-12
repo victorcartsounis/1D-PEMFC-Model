@@ -9,8 +9,10 @@ from mmm1d.state import stacked_index
 
 
 def test_default_sweep_converges_and_is_monotonic():
-    result = solve(tol=1e-4, n_per_region=15, max_nodes=200000)
+    result = solve(tol=1e-4, n_per_region=15)
 
+    assert len(result.voltages) == len(result.params.U_list), \
+        "the sweep stopped early instead of solving every voltage"
     assert result.converged, "not all solutions converged"
 
     # current must rise monotonically as the cell voltage drops

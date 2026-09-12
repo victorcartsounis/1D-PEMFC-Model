@@ -425,6 +425,30 @@ def build_initial_guess(params: Params, U_cell: float,
 # SOLVE
 # =============================================================================
 
+#: Default ceiling on adaptive mesh refinement, mirroring MATLAB ``bvp4c``.
+#:
+#: ``bvp4c`` caps its mesh at ``NMax = floor(10000/n)``, which is 125 points
+#: for this ``n = 80`` system, and the reference implementation ran on that
+#: default. The cap is doing real work here: ``k_ad`` switches discontinuously
+#: where ``lam`` crosses ``lambda_eq`` inside the CCL (``Params.k_ad``), so no
+#: mesh can drive the collocation residual there below ``tol``. ``bvp4c`` hits
+#: NMax, warns that the tolerance was not met, and returns a usable solution
+#: the sweep continues from; below about 0.75 V that is what the published
+#: curve rests on.
+#:
+#: Translating that ceiling as 200000 was the one part of the port that was
+#: not faithful, and it is why sweeps below 0.55 V died. ``solve_bvp``
+#: factorizes a collocation Jacobian holding ``2 * N_TOTAL ** 2 = 12800``
+#: nonzeros per interval -- roughly 0.85 GB of peak memory per 1000 nodes --
+#: so chasing the discontinuity to 200000 nodes would need some 170 GB. The
+#: process dies inside SuperLU with a ``MemoryError`` before ``solve_bvp``
+#: can return ``success=False``, taking the converged part of the sweep with
+#: it.
+#:
+#: Raising this buys resolution everywhere except at the crossing, at about
+#: 0.85 GB per 1000 nodes, and diverges from the reference implementation.
+DEFAULT_MAX_NODES = 10_000 // N_TOTAL
+
 
 @dataclass(frozen=True, eq=False)
 class SweepResult:
@@ -457,7 +481,7 @@ class SweepResult:
 def solve(voltages: Sequence[float] | np.ndarray | None = None,
           tol: float = 1e-4,
           n_per_region: int = 11,
-          max_nodes: int = 200_000,
+          max_nodes: int = DEFAULT_MAX_NODES,
           verbose: int = 0,
           params: Params | None = None) -> SweepResult:
     """Solve the model over a sweep of cell voltages.
@@ -474,7 +498,9 @@ def solve(voltages: Sequence[float] | np.ndarray | None = None,
     n_per_region
         Initial mesh points per region.
     max_nodes
-        Ceiling on adaptive mesh refinement.
+        Ceiling on adaptive mesh refinement. Defaults to MATLAB ``bvp4c``'s
+        ``floor(10000/n)``, the ceiling the reference implementation ran on;
+        see ``DEFAULT_MAX_NODES`` before raising it.
     verbose
         Passed through to ``solve_bvp`` (0, 1 or 2).
     params
@@ -492,12 +518,40 @@ def solve(voltages: Sequence[float] | np.ndarray | None = None,
 
     currents: list[float] = []
     solutions: list = []
-    for U_cell in voltages:
+    for position, U_cell in enumerate(voltages):
         bc = partial(boundary_conditions, U_cell=U_cell, params=params)
-        sol = solve_bvp(ode, bc, mesh, guess, tol=tol,
-                        max_nodes=max_nodes, verbose=verbose)
+        try:
+            sol = solve_bvp(ode, bc, mesh, guess, tol=tol,
+                            max_nodes=max_nodes, verbose=verbose)
+        except MemoryError:
+            # SuperLU could not factorize the collocation Jacobian; the mesh
+            # has run away. See DEFAULT_MAX_NODES.
+            remaining = voltages[position:]
+            warnings.warn(
+                f"ran out of memory solving U={U_cell:.3f} V with "
+                f"max_nodes={max_nodes}; stopping the sweep with "
+                f"{len(remaining)} of {len(voltages)} voltages unsolved: "
+                f"{np.array2string(remaining, precision=3)}")
+            voltages = voltages[:position]
+            break
+
         if not sol.success:
+            # bvp4c warns and carries on in exactly this situation, and the
+            # reference curve below about 0.75 V is made of such points, so
+            # the sweep continues too.
             warnings.warn(f"BVP did not converge for U={U_cell:.3f} V: {sol.message}")
+
+        if not np.all(np.isfinite(sol.y)):
+            # Continuation is genuinely poisoned: a non-finite solution cannot
+            # seed the next voltage, so every later point would fail too.
+            remaining = voltages[position:]
+            warnings.warn(
+                f"solution for U={U_cell:.3f} V is not finite; stopping the "
+                f"sweep with {len(remaining)} of {len(voltages)} voltages "
+                f"unsolved: {np.array2string(remaining, precision=3)}")
+            voltages = voltages[:position]
+            break
+
         currents.append(sol.y[current_index, -1] / 1e4)  # [A/m^2] -> [A/cm^2]
         solutions.append(sol)
         mesh, guess = sol.x, sol.y  # continuation into the next voltage
