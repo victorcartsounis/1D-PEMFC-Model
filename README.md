@@ -8,10 +8,8 @@ Written by **Victor Constantin Cartsounis** as the codebase for a master's
 thesis at **CEFET-MG**, supervised by **Sidney Nicodemos da Silva**.
 
 The model resolves eight coupled quantities across the five MEA layers — anode
-GDL, anode catalyst layer, membrane, cathode catalyst layer, cathode GDL —
-and will be extended over the course of the thesis. *Scope of the extensions
-still to be written up here (additional submodels, degradation, transient
-operation, validation against experimental data, parameter optimization).*
+GDL, anode catalyst layer, membrane, cathode catalyst layer, cathode GDL — and
+will be extended over the course of the thesis.
 
 ## Physics reference
 
