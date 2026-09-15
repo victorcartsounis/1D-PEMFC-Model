@@ -218,6 +218,20 @@ A sweep is run by continuation — each voltage starts from the previous
 converged solution — so voltages should be ordered from high (low current)
 downwards.
 
+## Graphical interface
+
+A PySide6 desktop front end — configure a run, see what governs each layer of
+the cell, and read the figures back in the window — lives in its own
+repository:
+
+**https://github.com/victorcartsounis/1D-PEMFC-Model-GUI**
+
+It depends on this package and not the other way round: nothing here imports
+it, the solver and the test suite need neither Qt nor the interface installed,
+and an interface bug cannot change a number this model produces. The names it
+is entitled to import are the ones `pemfc_1d` exports, listed in that
+package's docstring and pinned by `tests/test_public_api.py`.
+
 ## Tests
 
 ```bash
