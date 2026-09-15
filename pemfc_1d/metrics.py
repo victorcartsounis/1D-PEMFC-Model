@@ -30,11 +30,13 @@ from pathlib import Path
 import numpy as np
 import scipy
 
+from . import __version__ as MODEL_VERSION
 from .model import DEFAULT_MAX_NODES, SweepResult, solve
 from .params import Params
 
 __all__ = ["RunMetrics", "SolverSettings", "create_run_directory",
-           "sweep_metrics", "convergence_metrics", "write_run_log"]
+           "sweep_metrics", "convergence_metrics", "write_run_log",
+           "git_revision", "GB_PER_1000_NODES", "REFINEMENT_NODE_CEILING"]
 
 #: Peak memory ``solve_bvp`` needs per 1000 mesh nodes for this 80-state
 #: system, measured on the collocation Jacobian's LU factorization.
@@ -49,16 +51,31 @@ REFINEMENT_NODE_CEILING = 4_000
 # PROVENANCE
 # =============================================================================
 
-def _git_revision() -> str:
-    """Short commit hash of the working tree, marked if it has changes."""
+def git_revision(path: str | Path | None = None) -> str:
+    """Short commit hash of the checkout containing ``path``, marked if dirty.
+
+    ``path`` defaults to this package's own source directory, which answers
+    "which revision of the model ran?" for as long as the model is being
+    developed from a checkout. It stops answering it once the package is
+    installed as a dependency -- as it is for the separate GUI front end --
+    because the installed source does not sit in a repository at all.
+
+    That is why the log records ``__version__`` unconditionally alongside this:
+    the released version is always knowable, the revision only sometimes. A
+    caller that is itself a checkout should pass its own directory, so the log
+    says which revision of *the program that ran* produced the numbers.
+    """
+    directory = Path(__file__).resolve().parent if path is None else Path(path)
+    if not directory.is_dir():
+        directory = directory.parent
+
     def git(*args: str) -> str:
         return subprocess.run(("git", *args), capture_output=True, text=True,
-                              cwd=Path(__file__).resolve().parent,
-                              timeout=10).stdout.strip()
+                              cwd=directory, timeout=10).stdout.strip()
     try:
         revision = git("rev-parse", "--short", "HEAD")
         if not revision:
-            return "unknown (not a git repository)"
+            return "unknown (not a git checkout)"
         return f"{revision} (dirty)" if git("status", "--porcelain") else revision
     except (OSError, subprocess.SubprocessError):
         return "unknown (git unavailable)"
@@ -232,7 +249,8 @@ def _format_table(header: tuple[str, ...], rows: list[tuple[str, ...]]) -> list[
     return lines
 
 
-def _log_text(metrics: RunMetrics, directory: Path, command: str) -> str:
+def _log_text(metrics: RunMetrics, directory: Path, command: str,
+              revision: str) -> str:
     settings = metrics.settings
     finished = datetime.now().astimezone()
     lines = [
@@ -244,7 +262,8 @@ def _log_text(metrics: RunMetrics, directory: Path, command: str) -> str:
         f"Run directory  : {directory}",
         f"Started        : {metrics.started.isoformat(timespec='seconds')}",
         f"Finished       : {finished.isoformat(timespec='seconds')}",
-        f"Git revision   : {_git_revision()}",
+        f"Model version  : pemfc_1d {MODEL_VERSION}",
+        f"Git revision   : {revision}",
         f"Command        : {command}",
         f"Working dir    : {Path.cwd()}",
         f"Host           : {platform.node()} ({platform.platform()})",
@@ -336,9 +355,19 @@ def _log_text(metrics: RunMetrics, directory: Path, command: str) -> str:
 
 
 def write_run_log(metrics: RunMetrics, directory: Path,
-                  command: str | None = None, filename: str = "metrics.log") -> Path:
-    """Write ``metrics.log`` into ``directory`` and return its path."""
+                  command: str | None = None, filename: str = "metrics.log",
+                  revision: str | None = None) -> Path:
+    """Write ``metrics.log`` into ``directory`` and return its path.
+
+    ``revision`` identifies the program that produced the run. It defaults to
+    the revision of this package's own checkout, which is the right answer when
+    the model is run from its repository. A separate front end should pass
+    ``git_revision(<its own directory>)`` instead, so the log names the revision
+    that actually ran rather than reporting ``unknown`` from site-packages.
+    """
     command = " ".join(sys.argv) if command is None else command
+    revision = git_revision() if revision is None else revision
     path = Path(directory) / filename
-    path.write_text(_log_text(metrics, Path(directory), command), encoding="utf-8")
+    path.write_text(_log_text(metrics, Path(directory), command, revision),
+                    encoding="utf-8")
     return path

@@ -4,8 +4,10 @@ Run with: python -m pytest tests/
 """
 import numpy as np
 
+from pemfc_1d import __version__ as MODEL_VERSION
 from pemfc_1d.metrics import (SolverSettings, convergence_metrics,
-                              create_run_directory, sweep_metrics, write_run_log)
+                              create_run_directory, git_revision,
+                              sweep_metrics, write_run_log)
 from pemfc_1d.model import DEFAULT_MAX_NODES, solve
 
 
@@ -66,11 +68,31 @@ def test_log_records_provenance_settings_and_metrics(tmp_path):
         assert section in text, f"missing {section}"
 
     assert "Git revision" in text
+    # The released version is always knowable; the revision is not, once the
+    # package is installed rather than checked out.
+    assert f"Model version  : pemfc_1d {MODEL_VERSION}" in text
     assert "python run_example.py --no-show" in text
     assert f"max_nodes      : {DEFAULT_MAX_NODES}" in text
     # every solved voltage has a row
     for voltage in metrics.voltages:
         assert f"{voltage:.3f}" in text
+
+
+def test_log_records_the_revision_its_caller_supplies(tmp_path):
+    """A separate front end runs the model from site-packages, where the model's
+    own source is not a checkout. It passes its own revision so the log names
+    the program that actually ran."""
+    _, metrics = _small_sweep()
+    directory = create_run_directory(tmp_path)
+
+    path = write_run_log(metrics, directory, revision="abc1234 (dirty)")
+    text = path.read_text(encoding="utf-8")
+
+    assert "Git revision   : abc1234 (dirty)" in text
+
+
+def test_revision_of_a_directory_outside_any_checkout_is_reported_unknown(tmp_path):
+    assert git_revision(tmp_path) == "unknown (not a git checkout)"
 
 
 def test_convergence_check_is_skipped_rather_than_exhausting_memory():
