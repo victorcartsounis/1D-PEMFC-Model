@@ -4,8 +4,8 @@ Run with: python -m pytest tests/
 """
 import numpy as np
 
-from mmm1d import Region, State, solve
-from mmm1d.state import stacked_index
+from pemfc_1d import Region, State, solve
+from pemfc_1d.state import stacked_index
 
 
 def test_default_sweep_converges_and_is_monotonic():

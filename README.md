@@ -97,12 +97,12 @@ x_region(s) = Lsum[region] + s * L[region]      =>      dY/ds = L[region] * dY/d
 
 Interface continuity and gas-channel conditions are then imposed as boundary
 conditions on the stacked system, which is equivalent to solving the five
-layers as a coupled multi-region problem. See `mmm1d/model.py`.
+layers as a coupled multi-region problem. See `pemfc_1d/model.py`.
 
 ## Layout
 
 ```
-mmm1d/
+pemfc_1d/
 ├── state.py            # state-vector layout: Region / State / Quantity enums
 ├── params.py           # constants, operating conditions, constitutive relations
 ├── saturation.py       # capillary pressure -> liquid water saturation
@@ -199,8 +199,8 @@ the physics is an improvement.
 From Python:
 
 ```python
-from mmm1d import solve
-from mmm1d.postprocessing import plot_potentials_and_fluxes, plot_polarization_curve
+from pemfc_1d import solve
+from pemfc_1d.postprocessing import plot_potentials_and_fluxes, plot_polarization_curve
 
 result = solve()                      # default sweep
 print(result.voltages)                # [V]
@@ -248,7 +248,7 @@ The `.vscode/` folder ships ready-to-use configuration:
 
 * **`launch.json`** — run the default sweep, run the full polarization curve,
   debug the open file, or debug the test suite. Breakpoints work in
-  `mmm1d/model.py` as usual; open the Run and Debug panel (`Ctrl+Shift+D`).
+  `pemfc_1d/model.py` as usual; open the Run and Debug panel (`Ctrl+Shift+D`).
 * **`tasks.json`** — shell tasks (`Ctrl+Shift+P` → *Tasks: Run Task*) for
   `poetry install`, running the tests, and running the default sweep.
 * **`settings.json`** — enables the Testing panel with pytest auto-discovery.

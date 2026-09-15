@@ -4,7 +4,7 @@ timestamped run directory under results/ holding the potentials, fluxes
 and polarization curve figures plus a metrics.log.
 
 The log records what was run, when, against which revision of the code,
-and how good the answer is -- see mmm1d/metrics.py for why solver cost
+and how good the answer is -- see pemfc_1d/metrics.py for why solver cost
 and solution quality are reported as separate things.
 
 Examples
@@ -18,10 +18,10 @@ import time
 
 import matplotlib
 
-from mmm1d.metrics import (SolverSettings, convergence_metrics,
-                           create_run_directory, sweep_metrics, write_run_log)
-from mmm1d.model import DEFAULT_MAX_NODES, solve
-from mmm1d.postprocessing import plot_polarization_curve, plot_potentials_and_fluxes
+from pemfc_1d.metrics import (SolverSettings, convergence_metrics,
+                              create_run_directory, sweep_metrics, write_run_log)
+from pemfc_1d.model import DEFAULT_MAX_NODES, solve
+from pemfc_1d.postprocessing import plot_polarization_curve, plot_potentials_and_fluxes
 
 
 def main():

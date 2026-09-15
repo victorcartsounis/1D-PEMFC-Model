@@ -1,4 +1,4 @@
-"""mmm1d -- a 1D PEM fuel cell model: steady-state, non-isothermal, two-phase,
+"""pemfc_1d -- a 1D PEM fuel cell model: steady-state, non-isothermal, two-phase,
 macro-homogeneous membrane electrode assembly.
 
 Physics and constitutive relations follow:
@@ -9,7 +9,7 @@ Physics and constitutive relations follow:
 
 Quick start::
 
-    from mmm1d import solve
+    from pemfc_1d import solve
     result = solve()
     print(result.voltages, result.current_densities)
 """

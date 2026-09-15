@@ -39,7 +39,7 @@ occur, because they shape how the results should be read:
 * Darcy's law in the cathode catalyst layer uses the GDL permeability
   ``kappa_GDL`` rather than ``kappa_CL`` (see :func:`_ccl`).
 
-Together with the saturation floor described in :mod:`mmm1d.saturation`, these
+Together with the saturation floor described in :mod:`pemfc_1d.saturation`, these
 leave the two-phase behaviour inactive: liquid water neither forms nor moves.
 Re-enabling it is planned work; the regression tests pin the present behaviour
 so that change cannot happen unnoticed.

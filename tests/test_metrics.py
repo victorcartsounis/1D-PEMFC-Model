@@ -4,9 +4,9 @@ Run with: python -m pytest tests/
 """
 import numpy as np
 
-from mmm1d.metrics import (SolverSettings, convergence_metrics,
-                           create_run_directory, sweep_metrics, write_run_log)
-from mmm1d.model import DEFAULT_MAX_NODES, solve
+from pemfc_1d.metrics import (SolverSettings, convergence_metrics,
+                              create_run_directory, sweep_metrics, write_run_log)
+from pemfc_1d.model import DEFAULT_MAX_NODES, solve
 
 
 def _small_sweep():
