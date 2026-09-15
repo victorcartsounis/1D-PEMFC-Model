@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "1d-pemfc-model"
-version = "0.2.0"
+version = "0.3.0"
 description = "A 1D steady-state, non-isothermal, two-phase PEM fuel cell model in Python."
 authors = ["Victor Constantin Cartsounis <victor@example.com>"]
 readme = "README.md"

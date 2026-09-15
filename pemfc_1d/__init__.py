@@ -30,7 +30,7 @@ it directly when you want figures::
 """
 #: Defined before the submodule imports below, because ``metrics`` reads it back
 #: off this package while this module is still initialising.
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 from .metrics import (GB_PER_1000_NODES, REFINEMENT_NODE_CEILING, RunMetrics,
                       SolverSettings, convergence_metrics, create_run_directory,
