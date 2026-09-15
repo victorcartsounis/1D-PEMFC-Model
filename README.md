@@ -113,7 +113,9 @@ tests/
 │   └── reference_solution.npz   # validated reference output (golden file)
 ├── test_smoke.py                # convergence and monotonicity
 ├── test_regression.py           # full solution pinned to the golden file
-└── test_constitutive.py         # parameters and saturation inversion
+├── test_constitutive.py         # parameters, correlations, saturation inversion
+├── test_metrics.py              # run metrics, provenance and the on-disk log
+└── test_public_api.py           # the surface the GUI repository consumes
 docs/images/                     # example figures shown in this README
 run_example.py                   # command-line entry point
 ```
