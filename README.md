@@ -59,9 +59,8 @@ as a potential/flux pair — 16 first-order equations per layer, 80 in total.
 
 ## Example results
 
-All three figures below come from one command — the full voltage sweep of the
-[Running](#running) section — and are the same files any run writes into its
-own `results/` directory.
+All three figures below come from one command — a plain `python run_example.py`
+— and are the same files any run writes into its own `results/` directory.
 
 The polarization curve is the model's headline output: cell voltage against
 current density, with the power density on the right-hand axis. The activation
@@ -249,9 +248,9 @@ poetry install
 python run_example.py
 ```
 
-This solves the default voltage sweep (1.15 to 1.00 V in 50 mV steps), prints
-the current and power density at each voltage, and writes one timestamped run
-directory under `results/`:
+This solves the default voltage sweep — 1.15 V down to 0.40 V in 50 mV steps,
+the whole polarization curve — prints the current and power density at each
+voltage, and writes one timestamped run directory under `results/`:
 
 ```
 results/run_20260912_102554/
@@ -266,12 +265,17 @@ results/run_20260912_102554/
 Every run gets its own directory, so results are never overwritten and any
 figure can be traced back to the settings that produced it.
 
-For a full polarization curve including the mass-transport-limited region:
+`--voltages` narrows the sweep when only part of the curve is wanted — for
+just the activation region near open circuit:
 
 ```bash
-python run_example.py --no-show --voltages 1.15 1.10 1.05 1.00 0.95 0.90 0.85 \
-    0.80 0.75 0.70 0.65 0.60 0.55 0.50 0.45 0.40
+python run_example.py --no-show --voltages 1.15 1.10 1.05 1.00
 ```
+
+The sweep is run by continuation, each voltage starting from the previous
+converged solution, so 50 mV is a step size rather than a plotting resolution:
+widening it makes each starting guess worse until the solver stops converging.
+Order voltages from high (low current) downwards.
 
 At low voltage the mesh grows quickly and `solve_bvp` may report that it could
 not meet `--tol`, warning once per voltage. `--max-nodes` defaults to
@@ -317,19 +321,19 @@ From Python:
 from pemfc_1d import solve
 from pemfc_1d.postprocessing import plot_potentials_and_fluxes, plot_polarization_curve
 
-result = solve()                      # default sweep
+result = solve()                      # default sweep, 1.15 V down to 0.40 V
 print(result.voltages)                # [V]
 print(result.current_densities)       # [A/cm^2]
 print(result.power_densities)         # [W/cm^2]
-assert result.converged
 
 fig_potentials, fig_fluxes = plot_potentials_and_fluxes(result)
 fig_polarization = plot_polarization_curve(result)
 ```
 
-A sweep is run by continuation — each voltage starts from the previous
-converged solution — so voltages should be ordered from high (low current)
-downwards.
+`result.converged` is *not* asserted here: below about 0.75 V `solve_bvp`
+reports that it could not meet its tolerance, for the reason described above,
+and the default sweep now runs well past that. Judge those points by the
+mesh-convergence check rather than by the flag.
 
 ## Graphical interface
 
@@ -362,17 +366,29 @@ never to make a failing refactor pass.
 Some two-phase behaviour is intentionally inactive in this version; the tests
 pin it so it cannot change unnoticed.
 
+The golden file holds four voltages (1.15–1.00 V), named explicitly in
+`tests/test_regression.py` rather than taken from the default sweep. The two
+are separate on purpose: where the example sweep stops is a presentation
+choice, and changing it should not mean regenerating the stored profiles.
+
 ## Performance and convergence
 
-* The default sweep (1.15–1.00 V, 4 points) solves in about 3 seconds.
+* The default sweep (1.15–0.40 V, 16 points, reaching ~2.3 A/cm² in the
+  mass-transport-limited plateau) solves in about 13 seconds. The adaptive mesh
+  grows considerably at low voltage and reaches the node ceiling below about
+  0.70 V.
+* Just the activation region (`--voltages 1.15 1.10 1.05 1.00`) takes about 3
+  seconds.
+* A complete `python run_example.py` — the sweep, the mesh-convergence check
+  and all eight sensitivity parameters — takes about 5½ minutes and peaks
+  around 1.9 GB, almost all of it in the refined solve of the convergence
+  check. `--no-convergence-check` and `--no-sensitivity` each remove their
+  share.
 * The sensitivity analysis adds one 160-equation solve per parameter and per
   voltage, which dominates a run; `--no-sensitivity` or
   `--sensitivity-parameters` keeps it short. Its collocation Jacobian holds
   four times the non-zeros of the model's own, so budget roughly four times the
   memory per mesh node.
-* Tested down to 0.40 V (~2.3 A/cm², in the mass-transport-limited plateau);
-  the full 1.15–0.40 V sweep takes a couple of minutes, as the adaptive mesh
-  grows considerably at low voltage.
 * If `solve_bvp` fails to converge, increase `n_per_region` or `max_nodes`,
   narrow the voltage step for smoother continuation, or relax `tol`.
 
