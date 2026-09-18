@@ -11,6 +11,11 @@ The model resolves eight coupled quantities across the five MEA layers — anode
 GDL, anode catalyst layer, membrane, cathode catalyst layer, cathode GDL — and
 will be extended over the course of the thesis.
 
+It also answers how far the solution moves when a material property changes:
+the [forward sensitivity equations](#sensitivity-analysis) are solved for eight
+material parameters, giving `∂y/∂θ` across the MEA for every quantity and every
+flux.
+
 ## Physics reference
 
 The governing equations, constitutive relations and parameter values
@@ -99,6 +104,108 @@ Interface continuity and gas-channel conditions are then imposed as boundary
 conditions on the stacked system, which is equivalent to solving the five
 layers as a coupled multi-region problem. See `pemfc_1d/model.py`.
 
+## Sensitivity analysis
+
+How much does the answer depend on a material property that was measured once,
+in a different cell, and quoted to two significant figures? The model solves
+the **forward (direct) sensitivity equations** to say so.
+
+Differentiating `Y' = F(x, Y; θ)` with respect to a parameter `θ` gives a
+transport equation for the sensitivity `Z = ∂Y/∂θ`:
+
+```
+Z' = (∂F/∂Y)(x, Y; θ) · Z  +  ∂F/∂θ
+```
+
+`Z` is stacked onto the model and the pair — 160 first-order equations, 80 of
+the model and 80 of its sensitivity — is handed to the same `solve_bvp`,
+starting from the mesh and the solution the voltage sweep has already converged
+on. The boundary conditions for `Z` are the model's own residuals
+differentiated, which for this model is the same linear form with its constants
+removed: every residual is affine in the state, and none of the eight
+properties appears in one.
+
+### The derivatives come from the model, not from a second copy of it
+
+`∂F/∂Y` (80 × 80) and `∂F/∂θ` are **derived symbolically from the code that
+already runs**. `pemfc_1d/symbolic.py` calls `full_ode` itself with sympy
+symbols in place of the state and a numpy shim in place of `numpy`, so the
+expressions it evaluates are recorded rather than computed, and sympy
+differentiates those. Nothing about the physics is written a second time, so
+the Jacobian cannot drift away from the model it belongs to — change a
+constitutive relation in `params.py` and the sensitivity equations follow it.
+
+### What θ is
+
+Each parameter is a **dimensionless multiplier** on a material property, equal
+to 1 at the nominal parameter set, rather than the property's own value:
+
+| `θ` | Property | Scales |
+|---|---|---|
+| `sigma_e` | electrical conductivity | `sigma_e_GDL`, `sigma_e_CL` |
+| `sigma_p` | protonic conductivity | `Params.sigma_p` |
+| `k` | thermal conductivity | `k_GDL`, `k_CL`, `k_PEM` |
+| `D_lambda` | dissolved-water diffusivity in the ionomer | `Params.D_lambda` |
+| `eps_p_over_tau2` | pore/tortuosity factor `ε_p/τ²` | shared by every gas diffusivity |
+| `D_H2` | hydrogen diffusivity (the anode H₂/H₂O binary pair) | `Params.D_H2O_A` |
+| `D_O2` | oxygen diffusivity | `Params.D_O2` |
+| `kappa` | absolute hydraulic permeability | `kappa_GDL`, `kappa_CL` |
+
+A multiplier rather than the value itself because several of these are not
+single numbers — "electrical conductivity" is a GDL value *and* a CL value, and
+the pore/tortuosity factor is not a field at all but a factor inside a
+constitutive relation. It also leaves `∂Y/∂θ` in the units of `Y` for every
+parameter, so the eight figures are directly comparable: each reads as *how far
+the solution moves if this property were 100% larger*.
+
+### Validation
+
+Every result is checked against a central difference of the unmodified model:
+the sweep is re-solved at `θ = 1 ± ε` and `(Y(θ+ε) − Y(θ−ε)) / 2ε` compared with
+`Z(x)`. `tests/test_sensitivity.py` does this for all eight parameters, and
+checks `∂F/∂Y` and `∂F/∂θ` against differences of `full_ode` itself as well, so
+a disagreement can be localised to a term rather than just observed.
+
+### Running it
+
+It runs as part of `python run_example.py`, writing one figure per parameter:
+
+```
+results/run_20260918_142233/
+    sensitivity_sigma_e.png
+    sensitivity_sigma_p.png
+    ...
+```
+
+Each figure repeats the layout of the potentials and fluxes figures — eight
+quantities above their eight fluxes, one colour per cell voltage, each panel
+spanning only the layers where its quantity is defined — but plots `∂y/∂θ` and
+`∂j/∂θ` instead of `y` and `j`.
+
+The analysis is the expensive half of a run, so it has a switch.
+`SENSITIVITY_ENABLED` at the top of `run_example.py` turns it off, and
+`--no-sensitivity` does the same for one run; with it off the module is not
+even imported, so neither sympy nor the symbolic differentiation is paid for.
+`--sensitivity-parameters sigma_p D_O2` narrows it to the ones you care about.
+
+From Python:
+
+```python
+from pemfc_1d import solve
+from pemfc_1d.sensitivity import SENSITIVITY_PARAMETERS, solve_sensitivity
+from pemfc_1d.postprocessing import plot_sensitivity_profiles
+
+result = solve()
+sensitivity = solve_sensitivity(result, "sigma_p")
+print(sensitivity.current_sensitivities)      # dI/dtheta [A/cm^2] per voltage
+figure = plot_sensitivity_profiles(sensitivity)
+```
+
+`pemfc_1d.sensitivity` is deliberately *not* re-exported from the `pemfc_1d`
+namespace, for the same reason `pemfc_1d.postprocessing` is not: importing it
+pulls in sympy, and a run that only wants current densities should not pay for
+that.
+
 ## Layout
 
 ```
@@ -107,6 +214,9 @@ pemfc_1d/
 ├── params.py           # constants, operating conditions, constitutive relations
 ├── saturation.py       # capillary pressure -> liquid water saturation
 ├── model.py            # per-layer physics, boundary conditions, solve loop
+├── symbolic.py         # symbolic trace of full_ode, and its derivatives
+├── sensitivity.py      # forward sensitivity equations and the augmented solve
+├── metrics.py          # run metrics, provenance and the on-disk log
 └── postprocessing.py   # profile extraction and plots
 tests/
 ├── data/
@@ -115,6 +225,7 @@ tests/
 ├── test_regression.py           # full solution pinned to the golden file
 ├── test_constitutive.py         # parameters, correlations, saturation inversion
 ├── test_metrics.py              # run metrics, provenance and the on-disk log
+├── test_sensitivity.py          # sensitivities against central differences
 └── test_public_api.py           # the surface the GUI repository consumes
 docs/images/                     # example figures shown in this README
 run_example.py                   # command-line entry point
@@ -147,6 +258,8 @@ results/run_20260912_102554/
     potentials.png
     fluxes.png
     polarization_curve.png
+    sensitivity_sigma_e.png       # one per material parameter
+    ...
     metrics.log
 ```
 
@@ -252,6 +365,11 @@ pin it so it cannot change unnoticed.
 ## Performance and convergence
 
 * The default sweep (1.15–1.00 V, 4 points) solves in about 3 seconds.
+* The sensitivity analysis adds one 160-equation solve per parameter and per
+  voltage, which dominates a run; `--no-sensitivity` or
+  `--sensitivity-parameters` keeps it short. Its collocation Jacobian holds
+  four times the non-zeros of the model's own, so budget roughly four times the
+  memory per mesh node.
 * Tested down to 0.40 V (~2.3 A/cm², in the mass-transport-limited plateau);
   the full 1.15–0.40 V sweep takes a couple of minutes, as the adaptive mesh
   grows considerably at low voltage.
