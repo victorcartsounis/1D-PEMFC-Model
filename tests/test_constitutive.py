@@ -69,6 +69,20 @@ def params():
 # PARAMETERS
 # =============================================================================
 
+#: Stored fields that are not physical constants and so are not pinned.
+#:
+#: ``U_list`` is the voltage sweep an example run takes when the caller names
+#: none -- where the demonstration starts and stops, not a property of the
+#: cell. It is in the golden file only because the file stores every field of
+#: ``Params``. Pinning it would mean that moving the example's end point (it
+#: now runs to 0.40 V, so that a default run draws the whole polarization
+#: curve) reads as a change to the physics, which is the one thing this file is
+#: supposed to be able to tell apart. The voltages the golden solution was
+#: actually computed at are pinned separately, by ``golden["U"]`` in
+#: ``test_regression.py``.
+NOT_PHYSICAL_CONSTANTS = frozenset({"U_list"})
+
+
 def test_parameter_values_match_reference(golden, params):
     """Every physical constant, exactly -- no tolerance.
 
@@ -76,7 +90,8 @@ def test_parameter_values_match_reference(golden, params):
     edit rather than arithmetic drift.
     """
     stored = {key[len("param_"):]: golden[key]
-              for key in golden.files if key.startswith("param_")}
+              for key in golden.files if key.startswith("param_")
+              and key[len("param_"):] not in NOT_PHYSICAL_CONSTANTS}
     assert stored, "the golden file carries no parameters"
 
     wrong = {name: (getattr(params, name), value) for name, value in stored.items()

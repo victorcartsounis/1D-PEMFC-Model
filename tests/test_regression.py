@@ -29,6 +29,20 @@ GOLDEN = Path(__file__).parent / "data" / "reference_solution.npz"
 #: The stored profiles are (16, 5 * N_DENSE), so this is not free to change.
 N_DENSE = 11
 
+#: Voltages the golden file was produced at.
+#:
+#: Named here rather than inherited from ``Params``' default sweep. That sweep
+#: is a presentation choice -- it runs to 0.40 V so that an example run draws
+#: the whole polarization curve -- and tying the golden file to it would mean
+#: regenerating sixteen voltages' worth of stored profiles the next time
+#: somebody changes where the example stops. These four pin the same physics:
+#: every equation, every layer and every boundary condition is exercised at
+#: each of them.
+#:
+#: ``test_polarization_curve_matches_reference`` compares them against the
+#: voltages stored in the file, so the two cannot drift apart unnoticed.
+GOLDEN_VOLTAGES = (1.15, 1.10, 1.05, 1.00)
+
 #: Tolerance for quantities that come back out of ``solve_bvp``.
 #:
 #: The solver runs to ``tol=1e-4``, so this is five orders tighter than the
@@ -52,8 +66,8 @@ def golden():
 
 @pytest.fixture(scope="module")
 def swept():
-    """The default sweep, solved once for every test in this module."""
-    return solve()
+    """The golden file's sweep, solved once for every test in this module."""
+    return solve(voltages=GOLDEN_VOLTAGES)
 
 
 def test_polarization_curve_matches_reference(swept, golden):
