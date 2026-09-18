@@ -280,10 +280,20 @@ class SensitivitySettings:
     #: Which of ``SENSITIVITY_PARAMETERS`` to analyse; all eight by default.
     parameters: tuple[str, ...] = tuple(SENSITIVITY_PARAMETERS)
     tol: float = 1e-4
-    #: Ceiling on mesh refinement for the augmented solve. The base mesh is
-    #: reused as-is, so this only bounds any further refinement; see
-    #: ``GB_PER_1000_NODES``, which is four times the model's own figure.
-    max_nodes: int = DEFAULT_MAX_NODES
+    #: Ceiling on mesh refinement for the augmented solve. ``None``, the
+    #: default, means the base solution's own mesh: solve the sensitivity
+    #: equations where the model was solved and refine no further.
+    #:
+    #: Refining is the wrong instinct here. The mesh handed over is one the
+    #: sweep already converged on, and the sensitivity equations are linear in
+    #: Z about a Y that already satisfies the other half of the system, so
+    #: there is nothing left for the solver to find. Letting it refine instead
+    #: re-solves Y on a mesh the frozen saturation was not taken from (see
+    #: :func:`frozen_saturation`), and it chases the ``k_ad`` kink that no mesh
+    #: can resolve -- which in measurements moved dY/dtheta by two orders of
+    #: magnitude and cost thirty times the runtime. Raise it deliberately, and
+    #: mind ``GB_PER_1000_NODES``, four times the model's own figure.
+    max_nodes: int | None = None
     verbose: int = 0
 
     def resolved_parameters(self) -> tuple[SensitivityParameter, ...]:
@@ -349,10 +359,11 @@ def solve_sensitivity(result: SweepResult, parameter: str | SensitivityParameter
     for U_cell, base in zip(result.voltages, result.solutions):
         guess = np.vstack((base.y, np.zeros_like(base.y)))
         bc = partial(augmented_boundary_conditions, U_cell=U_cell, params=params)
-        solutions.append(solve_bvp(
-            ode, bc, base.x, guess, tol=settings.tol,
-            max_nodes=max(settings.max_nodes, base.x.size),
-            verbose=settings.verbose))
+        max_nodes = (base.x.size if settings.max_nodes is None
+                     else max(settings.max_nodes, base.x.size))
+        solutions.append(solve_bvp(ode, bc, base.x, guess, tol=settings.tol,
+                                   max_nodes=max_nodes,
+                                   verbose=settings.verbose))
 
     return SensitivityResult(parameter=parameter, voltages=result.voltages,
                              solutions=solutions, params=params,
