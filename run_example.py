@@ -10,7 +10,7 @@ and solution quality are reported as separate things.
 Examples
 --------
     python run_example.py
-    python run_example.py --voltages 1.15 1.10 1.05 1.00 --no-show
+    python run_example.py --voltages 1.15 1.10 1.05 1.00 --no-show   # just the top
     python run_example.py --no-convergence-check          # skip the refined solve
     python run_example.py --no-sensitivity                # skip the sensitivity study
     python run_example.py --sensitivity-parameters sigma_p D_O2
@@ -81,7 +81,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--voltages", type=float, nargs="+", default=None,
-                        help="cell voltages [V] to sweep over (default: 1.15 to 1.00 in 50 mV steps)")
+                        help="cell voltages [V] to sweep over (default: 1.15 to 0.40 in 50 mV steps, "
+                             "the whole polarization curve)")
     parser.add_argument("--tol", type=float, default=1e-4,
                         help="tolerance passed to scipy.integrate.solve_bvp (default: 1e-4, "
                              "the RelTol of the MATLAB reference implementation)")

@@ -29,7 +29,24 @@ def _default_layer_thicknesses() -> np.ndarray:
 
 
 def _default_voltage_sweep() -> np.ndarray:
-    return np.arange(1.15, 1.00 - 1e-9, -0.05)
+    """[V] 1.15 V down to 0.40 V in 50 mV steps.
+
+    The whole polarization curve, so that a default run draws all three of its
+    regions: activation near open circuit, the near-linear ohmic middle, and
+    the mass-transport-limited plateau past about 0.50 V. Stopping at 1.00 V,
+    as this used to, shows only the first.
+
+    50 mV is the step, not the resolution: each voltage is solved by
+    continuation from the previous one, and widening the step makes the
+    starting guess worse until the solver stops converging at all.
+
+    Below about 0.75 V ``solve_bvp`` reports that it could not meet its
+    tolerance, for the reason set out in ``model.DEFAULT_MAX_NODES``, and the
+    sweep carries on from the solution anyway -- as the reference
+    implementation does. Judge those points by the mesh-convergence check in
+    :mod:`pemfc_1d.metrics` rather than by the tolerance flag.
+    """
+    return np.arange(1.15, 0.40 - 1e-9, -0.05)
 
 
 @dataclass(frozen=True, eq=False)
