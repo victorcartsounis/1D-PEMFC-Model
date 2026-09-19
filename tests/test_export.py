@@ -25,10 +25,12 @@ import pytest
 from scipy.integrate import trapezoid
 
 from pemfc_1d import solve
-from pemfc_1d.export import (BY_LAYER_COLUMNS, FLUX_NAMES, RAW_COLUMNS,
-                             VALUE_NAMES, SensitivityExport,
-                             layer_integral_rows, run_id_from_directory,
-                             sensitivity_rows, write_sensitivity_exports)
+from pemfc_1d.export import (BY_LAYER_COLUMNS, FLUX_NAMES, NOMINAL_COLUMNS,
+                             POLARIZATION_COLUMNS, RAW_COLUMNS, VALUE_NAMES,
+                             SensitivityExport, layer_integral_rows,
+                             nominal_rows, polarization_rows,
+                             run_id_from_directory, sensitivity_rows,
+                             write_nominal_exports, write_sensitivity_exports)
 from pemfc_1d.postprocessing import FLUX_SCALE, VALUE_SCALE
 from pemfc_1d.sensitivity import SensitivitySettings, solve_sensitivity
 from pemfc_1d.state import (ACTIVE_REGIONS, N_TOTAL, Quantity, Region, State,
@@ -230,3 +232,101 @@ def test_the_by_layer_file_survives_a_failing_parameter(sensitivity, tmp_path):
             raise RuntimeError("the next parameter blew up")
     assert export.by_layer_path.exists()
     assert export.n_by_layer_rows > 0
+
+
+# =============================================================================
+# THE NOMINAL SOLUTION
+# =============================================================================
+#
+# These files exist so that a sensitivity can be normalised into an elasticity,
+# ``(dy/dtheta) / y``. That division is only meaningful if the ``y`` in the
+# denominator is the same solution, on the same mesh, in the same units as the
+# ``dy/dtheta`` in the numerator -- so that is what is pinned here, against the
+# sensitivity export itself rather than against recorded numbers.
+
+
+@pytest.fixture(scope="module")
+def swept():
+    """The plain sweep behind the sensitivity fixture, at the same voltage."""
+    return solve(voltages=VOLTAGES)
+
+
+@pytest.fixture(scope="module")
+def nominal(swept):
+    return list(nominal_rows(swept))
+
+
+def test_nominal_rows_land_on_the_same_mesh_as_the_sensitivity_rows(nominal, raw):
+    """Same (layer, variable, x_um, voltage) keys, so the two files join exactly.
+
+    An elasticity is a pointwise division. If the nominal export interpolated,
+    or skipped a quantity a layer does not define, the join would silently
+    drop rows or line values up against the wrong position.
+    """
+    esperado = {(row[0], row[1], row[2], row[5]) for row in raw}
+    assert {(row[0], row[1], row[2], row[3]) for row in nominal} == esperado
+
+
+def test_nominal_values_are_the_solution_in_the_units_of_the_figures(nominal, swept):
+    """A nominal number equals the solution row the figure plots, same scaling.
+
+    Checked on the same two rows as the sensitivity export: ``phi_e``, which is
+    unscaled, and ``j_e``, which is scaled by 1e-4 into A/cm^2. A factor of 1e4
+    between numerator and denominator would not raise anywhere -- it would just
+    make every elasticity wrong by four orders of magnitude.
+    """
+    solution = swept.solutions[0]
+    rows = _as_dicts(nominal, NOMINAL_COLUMNS)
+    for quantity, names, scales, row_of in (
+        (Quantity.PHI_E, VALUE_NAMES, VALUE_SCALE, lambda q: q.value_row),
+        (Quantity.PHI_E, FLUX_NAMES, FLUX_SCALE, lambda q: q.flux_row),
+    ):
+        written = np.array([float(row["value"]) for row in rows
+                            if row["layer"] == Region.AGDL.name
+                            and row["variable"] == names[quantity]])
+        row = stacked_index(row_of(quantity), Region.AGDL)
+        assert written == pytest.approx(solution.y[row] * scales[quantity])
+
+
+def test_nominal_export_reads_the_model_half_not_the_sensitivity_half(nominal, raw):
+    """``row_offset=0`` really selects ``Y``, not ``dY/dtheta``.
+
+    Both halves have the same shape and the same units, so reading the wrong
+    one produces a plausible file rather than an error. The two are pinned
+    apart by their content: the nominal temperature sits near the operating
+    point, while its sensitivity is a derivative scattered around zero.
+    """
+    nominais = np.array([float(row[4]) for row in nominal if row[1] == "T"])
+    derivadas = np.array([float(row[6]) for row in raw if row[1] == "T"])
+    assert nominais.min() > 250.0
+    assert abs(derivadas).max() < nominais.min()
+
+
+def test_polarization_rows_carry_the_sweep_s_own_currents(swept):
+    rows = _as_dicts(list(polarization_rows(swept)), POLARIZATION_COLUMNS)
+    corrente = [row for row in rows if row["variable"] == "I"]
+    potencia = [row for row in rows if row["variable"] == "P"]
+    assert [float(row["value"]) for row in corrente] == pytest.approx(
+        swept.current_densities)
+    assert [float(row["value"]) for row in potencia] == pytest.approx(
+        swept.power_densities)
+    assert {row["unit"] for row in corrente} == {"A/cm^2"}
+    assert {row["unit"] for row in potencia} == {"W/cm^2"}
+    assert [int(row["n_points"]) for row in corrente] == [
+        len(solution.x) for solution in swept.solutions]
+
+
+def test_writes_both_nominal_files_with_their_headers(swept, tmp_path):
+    directory = tmp_path / "run_20260919_070531"
+    directory.mkdir()
+    perfis, polarizacao = write_nominal_exports(swept, directory)
+
+    assert perfis.name == "nominal_profiles_20260919_070531.csv"
+    assert polarizacao.name == "polarization_20260919_070531.csv"
+    for path, columns, count in ((perfis, NOMINAL_COLUMNS, len(list(nominal_rows(swept)))),
+                                 (polarizacao, POLARIZATION_COLUMNS,
+                                  2 * swept.n_voltages)):
+        with path.open(newline="", encoding="utf-8") as handle:
+            written = list(csv.reader(handle))
+        assert tuple(written[0]) == columns
+        assert len(written) == count + 1
