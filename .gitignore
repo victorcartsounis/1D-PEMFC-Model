@@ -11,7 +11,12 @@ dist/
 results/
 figs/
 
-# Tables and figures built from a run by notebooks/analysis_sensitivity.ipynb
+# Analysis notebooks -- local dissertation working files, not part of the package
+notebooks/
+*.ipynb
+.ipynb_checkpoints/
+
+# Tables and figures built from a run by the analysis notebooks
 results_dissertacao/
 
 # Local working notes -- not published
