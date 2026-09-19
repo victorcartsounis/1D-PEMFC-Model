@@ -62,15 +62,21 @@ from scipy.integrate import trapezoid
 from .state import (ACTIVE_REGIONS, N_TOTAL, Quantity, Region, State,
                     block_rows)
 
-__all__ = ["RAW_COLUMNS", "BY_LAYER_COLUMNS", "VALUE_NAMES", "FLUX_NAMES",
+__all__ = ["RAW_COLUMNS", "BY_LAYER_COLUMNS", "NOMINAL_COLUMNS",
+           "POLARIZATION_COLUMNS", "VALUE_NAMES", "FLUX_NAMES",
            "SensitivityExport", "sensitivity_rows", "layer_integral_rows",
-           "write_sensitivity_exports", "run_id_from_directory"]
+           "nominal_rows", "polarization_rows", "write_sensitivity_exports",
+           "write_nominal_exports", "run_id_from_directory"]
 
 RAW_COLUMNS = ("layer", "variable", "x_um", "param", "theta", "voltage",
                "dydtheta", "unit")
 
 BY_LAYER_COLUMNS = ("layer", "variable", "param", "theta", "voltage",
                     "integral_abs", "integral_signed", "unit", "n_points")
+
+NOMINAL_COLUMNS = ("layer", "variable", "x_um", "voltage", "value", "unit")
+
+POLARIZATION_COLUMNS = ("voltage", "variable", "value", "unit", "n_points")
 
 #: Column name of each quantity, and of its flux. Deliberately plain ASCII
 #: rather than the LaTeX of the figures: these are spreadsheet column values.
@@ -157,9 +163,16 @@ def run_id_from_directory(directory: str | Path) -> str:
 # THE ROWS
 # =============================================================================
 
-def _profiles(result, voltage_index: int) -> Iterator[tuple[Region, np.ndarray,
-                                                            str, str, np.ndarray]]:
-    """Every exportable ``(region, x [um], variable, unit, dy/dtheta)`` of one voltage.
+def _profiles(result, voltage_index: int, row_offset: int = N_TOTAL
+              ) -> Iterator[tuple[Region, np.ndarray, str, str, np.ndarray]]:
+    """Every exportable ``(region, x [um], variable, unit, values)`` of one voltage.
+
+    ``row_offset`` selects which half of an augmented solution is read, the same
+    convention :func:`pemfc_1d.postprocessing.extract_profiles` uses: ``N_TOTAL``
+    (the default) is the ``dY/dtheta`` half of a :class:`SensitivityResult`, and
+    ``0`` is the model half -- which is the whole of a plain
+    :class:`~pemfc_1d.model.SweepResult` solution, and is what the nominal
+    export below writes.
 
     The layer is taken from the block of the stacked vector a row belongs to,
     not inferred by comparing ``x`` against ``params.Lsum``. The two agree
@@ -178,11 +191,11 @@ def _profiles(result, voltage_index: int) -> Iterator[tuple[Region, np.ndarray,
     params = result.params
     solution = result.solutions[voltage_index]
     s_mesh = solution.x                     # normalised, shared by all layers
-    sensitivity = solution.y[N_TOTAL:]      # the dY/dtheta half of the system
+    rows = solution.y[row_offset:row_offset + N_TOTAL]
 
     for region in Region:
         x_um = (params.Lsum[region] + s_mesh * params.L[region]) * 1e6
-        block = sensitivity[block_rows(region)]
+        block = rows[block_rows(region)]
         for quantity in Quantity:
             if region not in ACTIVE_REGIONS[quantity]:
                 continue
@@ -312,3 +325,85 @@ def write_sensitivity_exports(results: Sequence, directory: str | Path,
         for result in results:
             export.add(result)
     return export
+
+
+# =============================================================================
+# THE NOMINAL SOLUTION
+# =============================================================================
+#
+# Why these two files exist
+# -------------------------
+# The sensitivity files hold ``dY/dtheta`` and nothing else, which is enough to
+# rank parameters against each other but not to normalise them. ``theta`` is a
+# dimensionless multiplier whose nominal value is 1 (see the module docstring
+# of :mod:`pemfc_1d.sensitivity`), so
+#
+#     theta * dy/dtheta = dy/dln(theta)   at theta = 1
+#
+# and the elasticity of ``y`` with respect to the parameter is therefore just
+# ``(dy/dtheta) / y``. The parameter's own nominal value never enters. What does
+# enter is ``y`` itself, and until these files existed a run left no record of
+# it outside ``potentials.png`` and ``fluxes.png`` -- a figure again, which
+# cannot be divided by.
+#
+# ``nominal_profiles_<run_id>.csv`` is written on the solver's own converged
+# mesh, in the same units and under the same variable names as
+# ``sensitivity_raw_<run_id>.csv``, so the two join on
+# ``(layer, variable, x_um, voltage)`` with no interpolation and no unit
+# conversion in between. ``polarization_<run_id>.csv`` carries the cell current
+# and power, which are the denominators for the headline ``dI/dtheta``.
+
+
+def nominal_rows(result) -> Iterator[tuple]:
+    """Long/tidy rows of the nominal solution ``Y`` of a :class:`SweepResult`.
+
+    One row per mesh point, per variable, per voltage, in ``NOMINAL_COLUMNS``
+    order -- the same shape, mesh, units and variable names as
+    :func:`sensitivity_rows`, minus the ``param``/``theta`` columns, which a
+    solution taken at the nominal parameter set has no use for.
+    """
+    for index, voltage in enumerate(result.voltages):
+        for region, x_um, name, unit, values in _profiles(result, index, row_offset=0):
+            layer = region.name
+            for position, value in zip(x_um, values):
+                yield (layer, name, f"{position:.6f}", f"{voltage:.3f}",
+                       f"{value:.9e}", unit)
+
+
+def polarization_rows(result) -> Iterator[tuple]:
+    """The cell current and power at each voltage, in ``POLARIZATION_COLUMNS`` order.
+
+    Long rather than wide so that the unit travels with the number, as it does
+    in every other file here. ``n_points`` is the size of the converged mesh at
+    that voltage, which is what lets a reader line a row up against the
+    ``nodes`` column of ``metrics.log``.
+    """
+    for index, voltage in enumerate(result.voltages):
+        n_points = len(result.solutions[index].x)
+        yield (f"{voltage:.3f}", "I", f"{result.current_densities[index]:.9e}",
+               "A/cm^2", str(n_points))
+        yield (f"{voltage:.3f}", "P", f"{result.power_densities[index]:.9e}",
+               "W/cm^2", str(n_points))
+
+
+def write_nominal_exports(result, directory: str | Path,
+                          run_id: str | None = None) -> tuple[Path, Path]:
+    """Write ``nominal_profiles_<run_id>.csv`` and ``polarization_<run_id>.csv``.
+
+    Takes a :class:`~pemfc_1d.model.SweepResult`, not a sensitivity result: the
+    nominal solution is the sweep, and this costs no solving at all. Returns
+    the two paths written.
+    """
+    directory = Path(directory)
+    run_id = run_id_from_directory(directory) if run_id is None else run_id
+    written = []
+    for name, columns, rows in (
+            ("nominal_profiles", NOMINAL_COLUMNS, nominal_rows(result)),
+            ("polarization", POLARIZATION_COLUMNS, polarization_rows(result))):
+        path = directory / f"{name}_{run_id}.csv"
+        with path.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(columns)
+            writer.writerows(rows)
+        written.append(path)
+    return tuple(written)
