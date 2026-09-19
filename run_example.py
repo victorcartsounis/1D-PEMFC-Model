@@ -1,7 +1,8 @@
 """Command-line entry point: solves the model for a sweep of cell
 voltages, prints the resulting current densities, and writes one
 timestamped run directory under results/ holding the potentials, fluxes,
-sensitivity and polarization curve figures plus a metrics.log.
+sensitivity and polarization curve figures, the sensitivity analysis as
+two CSV tables, plus a metrics.log.
 
 The log records what was run, when, against which revision of the code,
 and how good the answer is -- see pemfc_1d/metrics.py for why solver cost
@@ -26,7 +27,9 @@ import matplotlib
 
 #: Run the forward sensitivity analysis (pemfc_1d/sensitivity.py) as part of a
 #: run, writing one ``sensitivity_<parameter>.png`` per material parameter
-#: alongside the other figures.
+#: alongside the other figures, and the underlying dY/dtheta as
+#: ``sensitivity_raw_<run_id>.csv`` and ``sensitivity_by_layer_<run_id>.csv``
+#: (pemfc_1d/export.py).
 #:
 #: Set this to False to switch the whole analysis off. Nothing of it then runs:
 #: the module is not even imported, so neither sympy nor the symbolic
@@ -51,11 +54,16 @@ from pemfc_1d.postprocessing import plot_polarization_curve, plot_potentials_and
 
 
 def run_sensitivity_analysis(result, parameters, directory):
-    """Solve the sensitivity equations and save one figure per parameter.
+    """Solve the sensitivity equations, then export and plot each parameter.
+
+    Both outputs come off the same solved object: ``export.add`` and
+    ``plot_sensitivity_profiles`` read the arrays ``solve_sensitivity``
+    returned, so writing the CSVs costs no extra solving.
 
     Imported here rather than at module level so that a run with the analysis
     switched off never loads sympy or the symbolic machinery.
     """
+    from pemfc_1d.export import SensitivityExport
     from pemfc_1d.postprocessing import plot_sensitivity_profiles
     from pemfc_1d.sensitivity import SensitivitySettings, solve_sensitivity
 
@@ -66,15 +74,21 @@ def run_sensitivity_analysis(result, parameters, directory):
           "(--no-sensitivity to skip)...")
 
     print("parameter           dI/dtheta [A/cm^2] per voltage")
-    for parameter in studied:
-        started = time.perf_counter()
-        sensitivity = solve_sensitivity(result, parameter, settings)
-        figure = plot_sensitivity_profiles(sensitivity)
-        figure.savefig(directory / f"sensitivity_{parameter.name}.png", dpi=150)
-        currents = "  ".join(f"{value:+.3e}"
-                             for value in sensitivity.current_sensitivities)
-        print(f"{parameter.name:18s}  {currents}   "
-              f"({time.perf_counter() - started:.1f} s)")
+    with SensitivityExport(directory) as export:
+        for parameter in studied:
+            started = time.perf_counter()
+            sensitivity = solve_sensitivity(result, parameter, settings)
+            export.add(sensitivity)
+            figure = plot_sensitivity_profiles(sensitivity)
+            figure.savefig(directory / f"sensitivity_{parameter.name}.png", dpi=150)
+            currents = "  ".join(f"{value:+.3e}"
+                                 for value in sensitivity.current_sensitivities)
+            print(f"{parameter.name:18s}  {currents}   "
+                  f"({time.perf_counter() - started:.1f} s)")
+
+    print(f"Sensitivity data: {export.raw_path.name} "
+          f"({export.n_raw_rows} rows) and {export.by_layer_path.name} "
+          f"({export.n_by_layer_rows} rows)")
 
 
 def main():
