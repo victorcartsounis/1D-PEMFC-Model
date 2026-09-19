@@ -17,6 +17,14 @@ sympy = "^1.14.0"
 [tool.poetry.group.dev.dependencies]
 pytest = ">=7.0"
 
+# Analysis notebooks only (notebooks/analysis_sensitivity.ipynb). Marked
+# python >=3.11 rather than widening the package's own "^3.9": the model
+# itself still runs on 3.9, and nothing in pemfc_1d imports these.
+pandas = { version = ">=2.2", python = ">=3.11" }
+jupyter = { version = ">=1.1", python = ">=3.11" }
+ipykernel = { version = ">=6.29", python = ">=3.11" }
+tabulate = { version = ">=0.9", python = ">=3.11" }
+
 [build-system]
 requires = ["poetry-core>=1.0.0"]
 build-backend = "poetry.core.masonry.api"
