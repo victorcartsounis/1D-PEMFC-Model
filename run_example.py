@@ -1,8 +1,8 @@
 """Command-line entry point: solves the model for a sweep of cell
 voltages, prints the resulting current densities, and writes one
 timestamped run directory under results/ holding the potentials, fluxes,
-sensitivity and polarization curve figures, the sensitivity analysis as
-two CSV tables, plus a metrics.log.
+sensitivity and polarization curve figures, the nominal solution and the
+sensitivity analysis as CSV tables, plus a metrics.log.
 
 The log records what was run, when, against which revision of the code,
 and how good the answer is -- see pemfc_1d/metrics.py for why solver cost
@@ -47,6 +47,7 @@ SENSITIVITY_ENABLED = True
 #: short while still looking at the ones that matter.
 SENSITIVITY_PARAMETERS = None
 
+from pemfc_1d.export import write_nominal_exports
 from pemfc_1d.metrics import (SolverSettings, convergence_metrics,
                               create_run_directory, sweep_metrics, write_run_log)
 from pemfc_1d.model import DEFAULT_MAX_NODES, solve
@@ -162,6 +163,11 @@ def main():
     figure_fluxes.savefig(directory / "fluxes.png", dpi=150)
     figure_polarization.savefig(directory / "polarization_curve.png", dpi=150)
     log_path = write_run_log(metrics, directory)
+
+    # The nominal solution behind those three figures, as numbers. Written for
+    # every run, with or without --sensitivity: it costs no solving, and it is
+    # what a sensitivity has to be divided by to become an elasticity.
+    write_nominal_exports(result, directory)
 
     if args.sensitivity and len(result.voltages):
         run_sensitivity_analysis(result, args.sensitivity_parameters, directory)
